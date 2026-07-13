@@ -8,6 +8,7 @@ This file records changes made by Vibe Meta relative to the fixed official sourc
 
 - Established the repository as the public Vibe Meta educational fork.
 - Documented upstream provenance, synchronization rules, security reporting, and the course evidence boundary.
+- Added a read-only pull-request and `main` verification workflow for patch whitespace, locked dependency installation, type checking, and production builds.
 
 ### Product behavior
 
