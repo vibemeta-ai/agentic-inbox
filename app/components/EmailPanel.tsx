@@ -8,6 +8,7 @@ import { useParams } from "react-router";
 import { Folders } from "shared/folders";
 import EmailPanelDialogs from "~/components/email-panel/EmailPanelDialogs";
 import EmailPanelHeader from "~/components/email-panel/EmailPanelHeader";
+import InboundOperationStatus from "~/components/email-panel/InboundOperationStatus";
 import EmailPanelToolbar from "~/components/email-panel/EmailPanelToolbar";
 import SingleMessageView from "~/components/email-panel/SingleMessageView";
 import ThreadMessage from "~/components/email-panel/ThreadMessage";
@@ -16,6 +17,7 @@ import api from "~/services/api";
 import { useDeleteEmail, useEmail, useMoveEmail, useReplyToEmail, useSendEmail, useThreadReplies, useUpdateEmail } from "~/queries/emails";
 import { useFolders } from "~/queries/folders";
 import { useMailbox } from "~/queries/mailboxes";
+import { useInboundOperation, useRetryInboundDraft } from "~/queries/operations";
 import { useUIStore } from "~/hooks/useUIStore";
 import type { Email, Folder, Mailbox } from "~/types";
 
@@ -32,6 +34,8 @@ function EmailPanelSkeleton() {
 export default function EmailPanel({ emailId }: { emailId: string }) {
 	const { mailboxId, folder } = useParams<{ mailboxId: string; folder: string }>();
 	const { data: email } = useEmail(mailboxId, emailId) as { data?: Email };
+	const { data: operation } = useInboundOperation(mailboxId, emailId);
+	const retryInboundDraft = useRetryInboundDraft();
 	const { data: threadRepliesRaw } = useThreadReplies(mailboxId, email?.thread_id) as {
 		data?: Email[];
 	};
@@ -89,7 +93,32 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 
 	const toggleStar = () => { if (mailboxId) updateEmail.mutate({ mailboxId, id: email.id, data: { starred: !email.starred } }); };
 	const handleMove = (folderId: string) => { if (mailboxId) { moveEmailMut.mutate({ mailboxId, id: email.id, folderId }); closePanel(); } };
-	const handleDelete = () => { if (mailboxId) { if (!window.confirm("Are you sure you want to delete this email?")) return; deleteEmailMut.mutate({ mailboxId, id: email.id }); closePanel(); } };
+	const handleDelete = () => {
+		if (!mailboxId) return;
+		if (operation?.emailId === email.id) {
+			toastManager.add({
+				title: "This request belongs to a durable operation and cannot be deleted.",
+				variant: "error",
+			});
+			return;
+		}
+		if (!window.confirm("Are you sure you want to delete this email?")) return;
+		deleteEmailMut.mutate({ mailboxId, id: email.id });
+		closePanel();
+	};
+	const handleRetryDraft = () => {
+		if (!mailboxId) return;
+		retryInboundDraft.mutate(
+			{ mailboxId, emailId },
+			{
+				onSuccess: () => toastManager.add({ title: "Draft retry started" }),
+				onError: (error) => toastManager.add({
+					title: error instanceof Error ? error.message : "Draft retry failed",
+					variant: "error",
+				}),
+			},
+		);
+	};
 
 	const handleEditDraft = (draftMsg?: Email) => {
 		const target = draftMsg || email;
@@ -109,6 +138,13 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 	const handleSendDraft = async (draftMsg?: Email) => {
 		let target = draftMsg || email;
 		if (!mailboxId || !currentMailbox) return;
+		if (operation?.currentDraftId === target.id) {
+			toastManager.add({
+				title: "Review this Agent Draft by editing or discarding it.",
+				variant: "error",
+			});
+			return;
+		}
 		setIsSending(true);
 		try {
 			if (!target.recipient || !target.subject) { try { const fresh = await api.getEmail(mailboxId, target.id) as Email; if (fresh) target = fresh; } catch {} }
@@ -148,7 +184,7 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 				isSending={isSending}
 				moveToFolders={moveToFolders}
 				onBack={closePanel}
-				onSendDraft={() => handleSendDraft()}
+					onSendDraft={() => handleSendDraft()}
 				onEditDraft={() => handleEditDraft()}
 				onReply={() =>
 					startCompose({ mode: "reply", originalEmail: lastReceivedMessage })
@@ -181,6 +217,14 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 				showThreadCount={hasThread}
 			/>
 
+			{operation && (
+				<InboundOperationStatus
+					operation={operation}
+					onRetryDraft={handleRetryDraft}
+					isRetrying={retryInboundDraft.isPending}
+				/>
+			)}
+
 			<div className="flex-1 overflow-y-auto">
 				{hasThread ? (
 					allMessages.map((msg, idx) => {
@@ -196,7 +240,7 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 								isSending={isDraft ? isSending : false}
 								isExpanded={expandedMessages.has(msg.id)}
 								onToggleExpand={() => toggleExpand(msg.id)}
-								onSendDraft={isDraft ? () => handleSendDraft(msg) : undefined}
+								onSendDraft={isDraft && operation?.currentDraftId !== msg.id ? () => handleSendDraft(msg) : undefined}
 								onEditDraft={isDraft ? () => handleEditDraft(msg) : undefined}
 								onDeleteDraft={isDraft ? () => handleDeleteDraft(msg) : undefined}
 								onViewSource={() => setSourceViewEmail(msg)}

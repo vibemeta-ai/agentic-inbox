@@ -8,9 +8,14 @@ import tailwindcss from "@tailwindcss/vite";
 import { defineConfig } from "vite";
 import tsconfigPaths from "vite-tsconfig-paths";
 
+const wranglerConfigPath = process.env.VIBE_META_WRANGLER_CONFIG;
+
 export default defineConfig({
   plugins: [
-    cloudflare({ viteEnvironment: { name: "ssr" } }),
+    cloudflare({
+      ...(wranglerConfigPath ? { configPath: wranglerConfigPath } : {}),
+      viteEnvironment: { name: "ssr" },
+    }),
     tailwindcss(),
     reactRouter(),
     tsconfigPaths(),

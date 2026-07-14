@@ -1,0 +1,40 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "agentic-inbox-test",
+	"compatibility_date": "2025-11-28",
+	"compatibility_flags": ["nodejs_compat"],
+	"main": "./test/worker.ts",
+	"vars": {
+		"DOMAINS": "inbox.test",
+		"EMAIL_ADDRESSES": ["lab@inbox.test"],
+		"TEACHING_ADMIN_TOKEN": "synthetic-teaching-admin-token"
+	},
+	"r2_buckets": [
+		{
+			"binding": "BUCKET",
+			"bucket_name": "agentic-inbox-test"
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "MAILBOX",
+				"class_name": "MailboxDO"
+			},
+			{
+				"name": "EMAIL_AGENT",
+				"class_name": "FakeEmailAgent"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["MailboxDO"]
+		},
+		{
+			"tag": "v2",
+			"new_classes": ["FakeEmailAgent"]
+		}
+	]
+}

@@ -13,6 +13,7 @@ import { createWorkersAI } from "workers-ai-provider";
 import { z } from "zod";
 import type { EmailFull, EmailMetadata } from "../lib/schemas";
 import { verifyDraft, isPromptInjection } from "../lib/ai";
+import { hasValidTeachingAdminToken } from "../lib/teaching-auth";
 import {
 	getMailboxStub,
 	stripHtmlToText,
@@ -107,8 +108,8 @@ async function getSystemPrompt(env: Env, mailboxId: string): Promise<string> {
 	return DEFAULT_SYSTEM_PROMPT;
 }
 
-function createEmailTools(env: Env, mailboxId: string) {
-	return {
+export function createEmailTools(env: Env, mailboxId: string, operationId?: string) {
+	const tools = {
 		list_emails: defineTool({
 			description:
 				"List emails in a folder. Returns email metadata (id, subject, sender, recipient, date, read/starred status, thread_id). Use folder='inbox' for received emails, 'sent' for sent emails.",
@@ -219,6 +220,7 @@ function createEmailTools(env: Env, mailboxId: string) {
 			}),
 			execute: async ({ originalEmailId, to, subject, body }): Promise<unknown> => {
 				return toolDraftReply(env, mailboxId, {
+					operationId,
 					originalEmailId,
 					to,
 					subject,
@@ -267,6 +269,16 @@ function createEmailTools(env: Env, mailboxId: string) {
 			},
 		}),
 	};
+
+	if (!operationId) return tools;
+
+	return {
+		list_emails: tools.list_emails,
+		get_email: tools.get_email,
+		get_thread: tools.get_thread,
+		search_emails: tools.search_emails,
+		draft_reply: tools.draft_reply,
+	};
 }
 
 // Use `any` for the Env generic to avoid type conflicts between the custom
@@ -298,15 +310,25 @@ export class EmailAgent extends AIChatAgent<any> {
 	 */
 	async onRequest(request: Request): Promise<Response> {
 		const url = new URL(request.url);
+		if (url.pathname === "/resetTeachingScenario" && request.method === "POST") {
+			const env = this.env as Env;
+			if (!(await hasValidTeachingAdminToken(request, env.TEACHING_ADMIN_TOKEN))) {
+				return new Response("Forbidden", { status: 403 });
+			}
+			await this.persistMessages([], [], { _deleteStaleRows: true });
+			return new Response(null, { status: 204 });
+		}
 		if (url.pathname === "/onNewEmail" && request.method === "POST") {
 			try {
-				const emailData = await request.json() as {
-					mailboxId: string;
+					const emailData = await request.json() as {
+						operationId: string;
+						mailboxId: string;
 					emailId: string;
-					sender: string;
-					subject: string;
-					threadId: string;
-				};
+						sender: string;
+						subject: string;
+						threadId: string;
+						operationStarted?: boolean;
+					};
 				const result = await this.handleNewEmail(emailData);
 				return new Response(JSON.stringify(result), {
 					headers: { "Content-Type": "application/json" },
@@ -327,21 +349,39 @@ export class EmailAgent extends AIChatAgent<any> {
 	 * drafts a response, and saves it to the Drafts folder.
 	 */
 	async handleNewEmail(emailData: {
+		operationId: string;
 		mailboxId: string;
 		emailId: string;
 		sender: string;
 		subject: string;
 		threadId: string;
+		operationStarted?: boolean;
 	}) {
 		const env = this.env as Env;
+		const stub = getMailboxStub(env, emailData.mailboxId);
+		if (!emailData.operationStarted) {
+			const attempt = await stub.startInboundDraft(emailData.operationId);
+			if (attempt.kind === "replay") {
+				return {
+					status: "draft_already_current",
+					draftId: attempt.operation.currentDraftId,
+				};
+			}
+		} else {
+			const operation = await stub.getInboundOperation(emailData.operationId);
+			if (operation?.state !== "drafting") {
+				return {
+					status: "draft_attempt_not_current",
+					draftId: operation?.currentDraftId ?? null,
+				};
+			}
+		}
 		const workersai = createWorkersAI({ binding: env.AI });
-		const tools = createEmailTools(env, emailData.mailboxId);
+		const tools = createEmailTools(env, emailData.mailboxId, emailData.operationId);
 		const systemPrompt = await getSystemPrompt(env, emailData.mailboxId);
 
 		// Pre-read the email and thread so the agent has full context
 		// without needing to waste tool calls discovering it
-		const stub = getMailboxStub(env, emailData.mailboxId);
-
 		let emailBody = "";
 		let threadContext = "";
 		try {
@@ -350,6 +390,10 @@ export class EmailAgent extends AIChatAgent<any> {
 				const isInjection = await isPromptInjection(env.AI, email.body);
 				if (isInjection) {
 					console.warn("Skipping auto-draft due to detected prompt injection:", emailData.emailId);
+					await stub.failInboundDraft(
+						emailData.operationId,
+						"prompt_injection_detected",
+					);
 					
 					// Log to agent chat so the user knows why it skipped
 					const newMessages = [
@@ -396,8 +440,12 @@ export class EmailAgent extends AIChatAgent<any> {
 			// that gets included in the agent's prompt.
 			if (threadContext) {
 				const threadInjection = await isPromptInjection(env.AI, threadContext);
-				if (threadInjection) {
-					console.warn("Skipping auto-draft due to prompt injection in thread context:", emailData.threadId);
+					if (threadInjection) {
+						console.warn("Skipping auto-draft due to prompt injection in thread context:", emailData.threadId);
+						await stub.failInboundDraft(
+							emailData.operationId,
+							"thread_prompt_injection_detected",
+						);
 					const newMessages = [
 						{
 							id: crypto.randomUUID(),
@@ -482,15 +530,12 @@ Based on the email content and thread context above, draft a reply using draft_r
 				if (!sanitizedText) {
 					// Inline text was entirely agent commentary, skip
 				} else {
-					const draftId = crypto.randomUUID();
-					const draftStub = getMailboxStub(env, emailData.mailboxId);
 					const reSubject = emailData.subject.startsWith("Re:")
 						? emailData.subject
 						: `Re: ${emailData.subject}`;
-					await draftStub.createEmail(
-						Folders.DRAFT,
-						{
-							id: draftId,
+					await stub.commitCurrentDraft({
+						operationId: emailData.operationId,
+						draft: {
 							subject: reSubject,
 							sender: emailData.mailboxId.toLowerCase(),
 							recipient: emailData.sender.toLowerCase(),
@@ -504,8 +549,7 @@ Based on the email content and thread context above, draft a reply using draft_r
 							email_references: null,
 							thread_id: emailData.threadId,
 						},
-						[],
-					);
+					});
 					// Inline text saved as draft
 				}
 			}
@@ -544,11 +588,28 @@ Based on the email content and thread context above, draft a reply using draft_r
 				},
 			];
 
+			const operation = await stub.getInboundOperation(emailData.operationId);
+			if (operation?.state !== "awaiting_human_review") {
+				await stub.failInboundDraft(
+					emailData.operationId,
+					"agent_did_not_produce_a_reviewable_draft",
+				);
+				return {
+					status: "error",
+					error: "Agent did not produce a reviewable Draft",
+				};
+			}
+
 			await this.persistMessages([...this.messages, ...newMessages]);
 
-			return { status: "draft_generated", text: result.text };
+			return {
+				status: "draft_generated",
+				draftId: operation.currentDraftId,
+				text: result.text,
+			};
 		} catch (e) {
 			console.error("Auto-draft failed:", (e as Error).message);
+			await stub.failInboundDraft(emailData.operationId, (e as Error).message);
 			return { status: "error", error: (e as Error).message };
 		}
 	}

@@ -49,8 +49,14 @@ jobs:
       - name: Install locked dependencies
         run: npm ci
 
+      - name: Run deterministic product tests
+        run: npm test
+
       - name: Type-check Worker and application code
         run: npm run typecheck
 
       - name: Build production bundles
         run: npm run build
+
+      - name: Validate reference deployment bundle
+        run: npm run reference:dry-run

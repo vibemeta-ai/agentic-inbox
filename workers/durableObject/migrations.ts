@@ -158,14 +158,57 @@ export const mailboxMigrations: Migration[] = [
         `),
 	},
 	{
-		// No txn() wrapper: Cloudflare's DO runtime requires state.storage.transactionSync()
+			// No txn() wrapper: Cloudflare's DO runtime requires state.storage.transactionSync()
 		// instead of SQL-level BEGIN TRANSACTION. These are idempotent CREATE INDEX IF NOT EXISTS
 		// statements so they're safe to run without a transaction.
 		name: "8_add_folder_date_indexes",
 		sql: `
             CREATE INDEX IF NOT EXISTS idx_emails_folder_id ON emails(folder_id);
             CREATE INDEX IF NOT EXISTS idx_emails_date ON emails(date);
-            CREATE INDEX IF NOT EXISTS idx_emails_folder_date ON emails(folder_id, date DESC);
-        `,
+			CREATE INDEX IF NOT EXISTS idx_emails_folder_date ON emails(folder_id, date DESC);
+		`,
+	},
+	{
+		name: "9_add_inbound_operations",
+		sql: txn(`
+			CREATE TABLE inbound_operations (
+				id TEXT PRIMARY KEY,
+				external_identity TEXT NOT NULL UNIQUE,
+				payload_hash TEXT NOT NULL,
+				email_id TEXT NOT NULL UNIQUE,
+				state TEXT NOT NULL,
+				current_draft_id TEXT,
+				last_error TEXT,
+				agent_attempts INTEGER NOT NULL DEFAULT 0,
+				conflict_count INTEGER NOT NULL DEFAULT 0,
+				last_conflict_payload_hash TEXT,
+				last_conflict_at TEXT,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			);
+
+			CREATE INDEX idx_inbound_operations_state
+				ON inbound_operations(state);
+		`),
+	},
+	{
+		name: "10_add_inbound_intake_recovery",
+		sql: txn(`
+			ALTER TABLE inbound_operations
+				ADD COLUMN intake_attempts INTEGER NOT NULL DEFAULT 0;
+			ALTER TABLE inbound_operations
+				ADD COLUMN attachment_manifest TEXT;
+			ALTER TABLE inbound_operations
+				ADD COLUMN last_intake_error TEXT;
+			ALTER TABLE inbound_operations
+				ADD COLUMN last_intake_failed_at TEXT;
+		`),
+	},
+	{
+		name: "11_add_durable_agent_trigger",
+		sql: txn(`
+			ALTER TABLE inbound_operations
+				ADD COLUMN pending_agent_trigger TEXT;
+		`),
 	},
 ];

@@ -20,6 +20,13 @@ import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
 import { Folders } from "../shared/folders";
 import type { Env } from "./types";
 import { requireMailbox, type MailboxContext } from "./lib/mailbox";
+import {
+	createAttachmentIdentity,
+	createInboundExternalIdentity,
+	createInboundPayloadHash,
+	normalizeMessageIdentity,
+} from "./lib/inbound-identity";
+import { hasValidTeachingAdminToken } from "./lib/teaching-auth";
 
 type AppContext = Context<MailboxContext>;
 
@@ -41,6 +48,10 @@ const DraftBody = z.object({
 	thread_id: z.string().optional(),
 	draft_id: z.string().optional(),
 });
+
+const TeachingResetBody = z.object({
+	mode: z.enum(["normal", "draft_failed"]).default("normal"),
+}).strict();
 
 // -- Helpers --------------------------------------------------------
 
@@ -91,6 +102,240 @@ app.get("/api/v1/config", (c) => {
 	const emailAddresses = c.env.EMAIL_ADDRESSES ?? [];
 	return c.json({ domains, emailAddresses });
 });
+
+const VM_1007_RESET_PATH = "/api/v1/teaching/scenarios/vm-1007/reset";
+const VM_1007_STATUS_PATH = "/api/v1/teaching/scenarios/vm-1007/status";
+const VM_1007_REPLAY_PATH = "/api/v1/teaching/scenarios/vm-1007/replay";
+const VM_1007_CONFLICT_PATH = "/api/v1/teaching/scenarios/vm-1007/conflict";
+
+function getTeachingMailboxId(env: Env): string | undefined {
+	const addresses = [...new Set(((env.EMAIL_ADDRESSES ?? []) as string[])
+		.map((address) => address.trim().toLowerCase())
+		.filter(Boolean))];
+	if (addresses.length !== 1) return undefined;
+
+	const domains = (env.DOMAINS || "")
+		.split(",")
+		.map((domain) => domain.trim().toLowerCase())
+		.filter(Boolean);
+	const address = addresses[0];
+	return domains.some((domain) => address === `lab@${domain}`)
+		? address
+		: undefined;
+}
+
+function createVm1007Email(
+	mailboxId: string,
+	variant: "baseline" | "conflict" = "baseline",
+): string {
+	const requestBody = variant === "conflict"
+		? "Changed payload under the same identity must be blocked."
+		: "Please check the synthetic order status.";
+	return [
+		"Message-ID: <vm-1007@example.test>",
+		"Date: Tue, 14 Jul 2026 07:00:00 +0000",
+		"From: Requester <requester@example.test>",
+		`To: ${mailboxId}`,
+		"Subject: Order VM-1007 status",
+		"MIME-Version: 1.0",
+		'Content-Type: multipart/mixed; boundary="vm-1007-boundary"',
+		"",
+		"--vm-1007-boundary",
+		"Content-Type: text/plain; charset=utf-8",
+		"",
+		requestBody,
+		"--vm-1007-boundary",
+		'Content-Type: text/plain; name="synthetic-order-VM-1007.txt"',
+		"Content-Transfer-Encoding: base64",
+		'Content-Disposition: attachment; filename="synthetic-order-VM-1007.txt"',
+		"",
+		"U3ludGhldGljIG9yZGVyIFZNLTEwMDcuCg==",
+		"--vm-1007-boundary--",
+	].join("\r\n");
+}
+
+type TeachingScenarioAuthorization =
+	| { mailboxId: string }
+	| { error: string; status: 403 | 409 };
+
+async function authorizeTeachingScenario(
+	c: AppContext,
+): Promise<TeachingScenarioAuthorization> {
+	if (!(await hasValidTeachingAdminToken(c.req.raw, c.env.TEACHING_ADMIN_TOKEN))) {
+		return { error: "Teaching Admin authorization required", status: 403 };
+	}
+
+	const mailboxId = getTeachingMailboxId(c.env);
+	if (!mailboxId) {
+		return {
+			error: "VM-1007 requires exactly one allowlisted lab@ mailbox on a configured domain",
+			status: 409,
+		};
+	}
+
+	return { mailboxId };
+}
+
+async function parseTeachingResetBody(c: AppContext) {
+	const rawBody = await c.req.text();
+	let input: unknown = {};
+	if (rawBody.trim()) {
+		try {
+			input = JSON.parse(rawBody);
+		} catch {
+			return { error: "Teaching reset body must be valid JSON" } as const;
+		}
+	}
+
+	const parsed = TeachingResetBody.safeParse(input);
+	return parsed.success
+		? parsed.data
+		: { error: "Teaching reset mode must be normal or draft_failed" } as const;
+}
+
+async function deliverVm1007(
+	env: Env,
+	mailboxId: string,
+	variant: "baseline" | "conflict",
+	runAgent: boolean,
+) {
+	const raw = new TextEncoder().encode(createVm1007Email(mailboxId, variant));
+	const pending: Promise<unknown>[] = [];
+	const teachingContext = {
+		waitUntil(promise: Promise<unknown>) {
+			pending.push(promise);
+		},
+		passThroughOnException() {},
+	} as unknown as ExecutionContext;
+	await receiveEmail(
+		{ raw: new Blob([raw]).stream(), rawSize: raw.byteLength },
+		env,
+		teachingContext,
+		{ runAgent },
+	);
+	await Promise.all(pending);
+}
+
+async function getVm1007Projection(env: Env, mailboxId: string) {
+	const mailbox = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxId));
+	const inbox = await mailbox.getEmails({ folder: Folders.INBOX });
+	const email = inbox.find((candidate) => candidate.subject === "Order VM-1007 status");
+	if (!email) return undefined;
+	const operation = await mailbox.getInboundOperationByEmailId(email.id);
+	return operation ? { email, operation } : undefined;
+}
+
+app.post(VM_1007_RESET_PATH, async (c) => {
+	const authorization = await authorizeTeachingScenario(c);
+	if ("error" in authorization) {
+		return c.json({ error: authorization.error }, authorization.status);
+	}
+	const resetBody = await parseTeachingResetBody(c);
+	if ("error" in resetBody) return c.json({ error: resetBody.error }, 400);
+	const { mailboxId } = authorization;
+
+	const mailbox = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(mailboxId));
+	const resetPlan = await mailbox.getTeachingResetPlan();
+	if (resetPlan.attachmentKeys.length > 0) {
+		await c.env.BUCKET.delete(resetPlan.attachmentKeys);
+	}
+	const removed = await mailbox.resetTeachingScenario();
+
+	const agent = c.env.EMAIL_AGENT.get(c.env.EMAIL_AGENT.idFromName(mailboxId));
+	const agentReset = await agent.fetch(new Request("https://agents/resetTeachingScenario", {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${c.env.TEACHING_ADMIN_TOKEN}`,
+		},
+	}));
+	if (!agentReset.ok) {
+		return c.json({ error: "Failed to reset teaching Agent state" }, 502);
+	}
+
+	await c.env.BUCKET.put(
+		`mailboxes/${mailboxId}.json`,
+		JSON.stringify({
+			fromName: "Vibe Meta Lab",
+			forwarding: { enabled: false, email: "" },
+			signature: { enabled: false, text: "" },
+			autoReply: { enabled: false, subject: "", message: "" },
+		}),
+	);
+
+	await deliverVm1007(
+		c.env,
+		mailboxId,
+		"baseline",
+		resetBody.mode === "normal",
+	);
+
+	const projection = await getVm1007Projection(c.env, mailboxId);
+	if (!projection) {
+		return c.json({ error: "VM-1007 seed did not create the inbox request" }, 500);
+	}
+	let operation = projection.operation;
+	if (resetBody.mode === "draft_failed") {
+		const failure = await mailbox.failInboundDraft(
+			operation.id,
+			"synthetic_teaching_draft_failure",
+		);
+		operation = failure.operation;
+	}
+
+	return c.json({
+		scenario: "vm-1007",
+		mode: resetBody.mode,
+		mailboxId,
+		emailId: projection.email.id,
+		operation,
+		removed,
+	});
+});
+
+app.get(VM_1007_STATUS_PATH, async (c) => {
+	const authorization = await authorizeTeachingScenario(c);
+	if ("error" in authorization) {
+		return c.json({ error: authorization.error }, authorization.status);
+	}
+	const { mailboxId } = authorization;
+	const mailbox = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(mailboxId));
+	return c.json({
+		scenario: "vm-1007",
+		mailboxId,
+		operations: await mailbox.listInboundOperations(),
+	});
+});
+
+async function deliverVm1007Replay(
+	c: AppContext,
+	variant: "baseline" | "conflict",
+) {
+	const authorization = await authorizeTeachingScenario(c);
+	if ("error" in authorization) {
+		return c.json({ error: authorization.error }, authorization.status);
+	}
+	const { mailboxId } = authorization;
+	if (!(await getVm1007Projection(c.env, mailboxId))) {
+		return c.json({ error: "Reset VM-1007 before replaying a delivery" }, 409);
+	}
+
+	await deliverVm1007(c.env, mailboxId, variant, false);
+	const projection = await getVm1007Projection(c.env, mailboxId);
+	if (!projection) {
+		return c.json({ error: "VM-1007 projection disappeared during replay" }, 500);
+	}
+
+	return c.json({
+		scenario: "vm-1007",
+		action: variant === "baseline" ? "exact_replay" : "changed_payload_conflict",
+		mailboxId,
+		emailId: projection.email.id,
+		operation: projection.operation,
+	});
+}
+
+app.post(VM_1007_REPLAY_PATH, (c) => deliverVm1007Replay(c, "baseline"));
+app.post(VM_1007_CONFLICT_PATH, (c) => deliverVm1007Replay(c, "conflict"));
 
 // -- Mailboxes ------------------------------------------------------
 
@@ -215,16 +460,64 @@ app.post("/api/v1/mailboxes/:mailboxId/drafts", async (c: AppContext) => {
 	const mailboxId = c.req.param("mailboxId")!;
 	const { to, cc, bcc, subject, body, in_reply_to, thread_id, draft_id } = DraftBody.parse(await c.req.json());
 	const stub = c.var.mailboxStub;
-	if (draft_id) await stub.deleteEmail(draft_id); // not atomic — create-then-delete would be safer
-	const messageId = crypto.randomUUID();
 	const now = new Date().toISOString();
+	if (draft_id) {
+		const updated = await stub.updateDraft(draft_id, {
+			subject: subject || "",
+			sender: mailboxId.toLowerCase(),
+			recipient: (to || "").toLowerCase(),
+			cc: cc?.toLowerCase() || null,
+			bcc: bcc?.toLowerCase() || null,
+			date: now,
+			body,
+			in_reply_to: in_reply_to || null,
+			email_references: null,
+			thread_id: thread_id || in_reply_to || draft_id,
+		});
+		if (!updated) return c.json({ error: "Draft not found" }, 404);
+		return c.json({ id: draft_id, draft_id, status: "draft", subject: subject || "", recipient: to || "", date: now });
+	}
+
+	const messageId = crypto.randomUUID();
 	await stub.createEmail(Folders.DRAFT, {
 		id: messageId, subject: subject || "", sender: mailboxId.toLowerCase(),
 		recipient: (to || "").toLowerCase(), cc: cc?.toLowerCase() || null, bcc: bcc?.toLowerCase() || null,
 		date: now, body, in_reply_to: in_reply_to || null, email_references: null,
 		thread_id: thread_id || in_reply_to || messageId,
 	}, []);
-	return c.json({ id: messageId, status: "draft", subject: subject || "", recipient: to || "", date: now }, 201);
+	return c.json({ id: messageId, draft_id: messageId, status: "draft", subject: subject || "", recipient: to || "", date: now }, 201);
+});
+
+app.get("/api/v1/mailboxes/:mailboxId/emails/:id/operation", async (c: AppContext) => {
+	const operation = await c.var.mailboxStub.getInboundOperationByEmailId(
+		c.req.param("id")!,
+	);
+	return operation
+		? c.json(operation)
+		: c.json({ error: "Inbound operation not found" }, 404);
+});
+
+app.post("/api/v1/mailboxes/:mailboxId/emails/:id/operation/retry-draft", async (c: AppContext) => {
+	const emailId = c.req.param("id")!;
+	const email = await c.var.mailboxStub.getEmail(emailId);
+	if (!email) return c.json({ error: "Email not found" }, 404);
+	const operation = await c.var.mailboxStub.getInboundOperationByEmailId(emailId);
+	if (!operation) return c.json({ error: "Inbound operation not found" }, 404);
+	if (operation.state !== "draft_failed") {
+		return c.json({ error: `Cannot retry Draft from state ${operation.state}` }, 409);
+	}
+
+	const mailboxId = c.req.param("mailboxId")!;
+	const attempt = await c.var.mailboxStub.scheduleInboundDraft({
+		operationId: operation.id,
+		mailboxId,
+		emailId,
+		sender: email.sender || "",
+		subject: email.subject || "",
+		threadId: email.thread_id || emailId,
+	});
+	if (attempt.kind === "replay") return c.json(attempt.operation, 409);
+	return c.json(attempt.operation, 202);
 });
 
 app.get("/api/v1/mailboxes/:mailboxId/emails/:id", async (c: AppContext) => {
@@ -243,9 +536,24 @@ app.put("/api/v1/mailboxes/:mailboxId/emails/:id", async (c: AppContext) => {
 
 app.delete("/api/v1/mailboxes/:mailboxId/emails/:id", async (c: AppContext) => {
 	const id = c.req.param("id")!;
-	const attachments = await c.var.mailboxStub.deleteEmail(id);
-	if (attachments === null) return c.json({ error: "Not found" }, 404);
-	if (attachments.length > 0) await c.env.BUCKET.delete(attachments.map((att: any) => `attachments/${id}/${att.id}/${att.filename}`));
+	const rejected = await c.var.mailboxStub.rejectCurrentDraft(id);
+	if (rejected) return c.body(null, 204);
+	const deletion = await c.var.mailboxStub.deleteEmail(id);
+	if (deletion === null) return c.json({ error: "Not found" }, 404);
+	if (deletion.kind === "blocked") {
+		return c.json({
+			error: "Cannot delete the source request while its durable operation is retained",
+			operationId: deletion.operationId,
+			state: deletion.state,
+		}, 409);
+	}
+	if (deletion.attachments.length > 0) {
+		await c.env.BUCKET.delete(
+			deletion.attachments.map((attachment) =>
+				`attachments/${id}/${attachment.id}/${attachment.filename}`
+			),
+		);
+	}
 	return c.body(null, 204);
 });
 
@@ -268,7 +576,19 @@ app.post("/api/v1/mailboxes/:mailboxId/threads/:threadId/read", async (c: AppCon
 
 // -- Reply / Forward ------------------------------------------------
 
-app.post("/api/v1/mailboxes/:mailboxId/emails/:id/reply", handleReplyEmail);
+app.post("/api/v1/mailboxes/:mailboxId/emails/:id/reply", async (c: AppContext) => {
+	const operation = await c.var.mailboxStub.getInboundOperationByEmailId(
+		c.req.param("id")!,
+	);
+	if (operation?.state === "awaiting_human_review" && operation.currentDraftId) {
+		return c.json({
+			error: "This operation stops at human review; external delivery is not enabled",
+			operationId: operation.id,
+			state: operation.state,
+		}, 409);
+	}
+	return handleReplyEmail(c);
+});
 app.post("/api/v1/mailboxes/:mailboxId/emails/:id/forward", handleForwardEmail);
 
 // -- Folders --------------------------------------------------------
@@ -345,7 +665,16 @@ async function streamToArrayBuffer(stream: ReadableStream, streamSize: number) {
 	return result;
 }
 
-async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env: Env, ctx: ExecutionContext) {
+interface ReceiveEmailOptions {
+	runAgent?: boolean;
+}
+
+async function receiveEmail(
+	event: { raw: ReadableStream; rawSize: number },
+	env: Env,
+	_ctx: ExecutionContext,
+	options: ReceiveEmailOptions = {},
+) {
 	const rawEmail = await streamToArrayBuffer(event.raw, event.rawSize);
 	const parsedEmail = await new PostalMime().parse(rawEmail);
 
@@ -363,50 +692,131 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 	} else { mailboxId = allRecipients[0]; }
 	if (!mailboxId) throw new Error("received email with no valid recipient address");
 
-	const messageId = crypto.randomUUID();
 	if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) { console.log(`Ignoring email for ${mailboxId}: mailbox does not exist`); return; }
 
 	const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxId));
+	const originalMessageId = parsedEmail.messageId
+		? normalizeMessageIdentity(parsedEmail.messageId)
+		: null;
+	const payloadHash = await createInboundPayloadHash({
+		mailboxId,
+		sender: parsedEmail.from?.address || "",
+		recipients: allRecipients,
+		cc: ccRecipients,
+		bcc: bccRecipients,
+		subject: parsedEmail.subject || "",
+		body: parsedEmail.html || parsedEmail.text || "",
+		attachments: parsedEmail.attachments || [],
+	});
+	const externalIdentity = await createInboundExternalIdentity({
+		mailboxId,
+		messageId: originalMessageId,
+		rawEmail,
+	});
+	const claim = await stub.claimInboundOperation({
+		externalIdentity,
+		payloadHash,
+	});
 
-	const attachmentData: StoredAttachment[] = [];
-	if (parsedEmail.attachments) {
-		for (const att of parsedEmail.attachments) {
-			const attId = crypto.randomUUID();
-			const filename = (att.filename || "untitled").replace(/[\/\\:*?"<>|\x00-\x1f]/g, "_");
-			await env.BUCKET.put(`attachments/${messageId}/${attId}/${filename}`, att.content);
-			attachmentData.push({ id: attId, email_id: messageId, filename, mimetype: att.mimeType,
-				size: typeof att.content === "string" ? att.content.length : att.content.byteLength,
-				content_id: att.contentId || null, disposition: att.disposition || "attachment" });
-		}
+	if (claim.kind === "conflict") {
+		console.error(`Inbound identity conflict for operation ${claim.operation.id}`);
+		return;
+	}
+	if (
+		claim.kind === "replay" &&
+		claim.operation.state !== "received" &&
+		claim.operation.state !== "storing_attachments" &&
+		claim.operation.state !== "intake_failed"
+	) {
+		return;
 	}
 
+	const messageId = claim.operation.emailId;
 	const extractMsgId = (s: string) => { const m = s.match(/<([^>]+)>/); return m ? m[1] : s.trim().split(/\s+/)[0]; };
 	const inReplyTo = parsedEmail.inReplyTo ? extractMsgId(parsedEmail.inReplyTo) : null;
 	const emailReferences = parsedEmail.references ? parsedEmail.references.split(/\s+/).filter(Boolean).map(extractMsgId) : [];
 	let threadId = emailReferences[0] || inReplyTo || messageId;
+	let commit: Awaited<ReturnType<typeof stub.commitInboundOperation>>;
+	try {
+		const attachmentData: StoredAttachment[] = [];
+		const attachmentWrites: Array<{
+			key: string;
+			content: string | ArrayBuffer | Uint8Array;
+		}> = [];
+		if (parsedEmail.attachments) {
+			for (const [index, att] of parsedEmail.attachments.entries()) {
+				const filename = (att.filename || "untitled").replace(/[\/\\:*?"<>|\x00-\x1f]/g, "_");
+				const attId = await createAttachmentIdentity({
+					operationId: claim.operation.id,
+					index,
+					filename,
+					content: att.content,
+				});
+				const key = `attachments/${messageId}/${attId}/${filename}`;
+				attachmentWrites.push({ key, content: att.content });
+				attachmentData.push({ id: attId, email_id: messageId, filename, mimetype: att.mimeType,
+					size: typeof att.content === "string" ? att.content.length : att.content.byteLength,
+					content_id: att.contentId || null, disposition: att.disposition || "attachment" });
+			}
+		}
 
-	if (!inReplyTo && emailReferences.length === 0) {
-		const subjectThread = await (stub as any).findThreadBySubject(parsedEmail.subject || "", parsedEmail.from?.address || undefined);
-		if (subjectThread) threadId = subjectThread;
+		if (!inReplyTo && emailReferences.length === 0) {
+			const subjectThread = await (stub as any).findThreadBySubject(parsedEmail.subject || "", parsedEmail.from?.address || undefined);
+			if (subjectThread) threadId = subjectThread;
+		}
+
+		const prepared = await stub.prepareInboundIntake({
+			operationId: claim.operation.id,
+			attachmentManifest: attachmentWrites.map((write, index) => ({
+				id: attachmentData[index].id,
+				key: write.key,
+				filename: attachmentData[index].filename,
+				size: attachmentData[index].size,
+				mimetype: attachmentData[index].mimetype,
+			})),
+		});
+		if (prepared.kind === "replay") return;
+
+		for (const attachment of attachmentWrites) {
+			await env.BUCKET.put(attachment.key, attachment.content);
+		}
+		commit = await stub.commitInboundOperation({
+			operationId: claim.operation.id,
+			email: {
+				subject: parsedEmail.subject || "",
+				sender: (parsedEmail.from?.address || "").toLowerCase(), recipient: allRecipients.join(", "),
+				cc: ccRecipients.join(", ") || null, bcc: bccRecipients.join(", ") || null,
+				date: new Date().toISOString(), // uses receive time, not the email's Date header
+				body: parsedEmail.html || parsedEmail.text || "",
+				in_reply_to: inReplyTo, email_references: emailReferences.length > 0 ? JSON.stringify(emailReferences) : null,
+				thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(parsedEmail.headers),
+			},
+			attachments: attachmentData,
+		});
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		try {
+			await stub.failInboundIntake(claim.operation.id, message);
+		} catch (recordError) {
+			console.error(
+				`Failed to record intake failure for ${claim.operation.id}:`,
+				recordError,
+			);
+		}
+		throw error;
 	}
 
-	const originalMessageId = parsedEmail.messageId ? extractMsgId(parsedEmail.messageId) : null;
+	if (commit.kind === "replay") return;
+	if (options.runAgent === false) return;
 
-	await stub.createEmail(Folders.INBOX, {
-		id: messageId, subject: parsedEmail.subject || "",
-		sender: (parsedEmail.from?.address || "").toLowerCase(), recipient: allRecipients.join(", "),
-		cc: ccRecipients.join(", ") || null, bcc: bccRecipients.join(", ") || null,
-		date: new Date().toISOString(), // uses receive time, not the email's Date header
-		body: parsedEmail.html || parsedEmail.text || "",
-		in_reply_to: inReplyTo, email_references: emailReferences.length > 0 ? JSON.stringify(emailReferences) : null,
-		thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(parsedEmail.headers),
-	}, attachmentData);
-
-	const agentStub = env.EMAIL_AGENT.get(env.EMAIL_AGENT.idFromName(mailboxId));
-	ctx.waitUntil(agentStub.fetch(new Request("https://agents/onNewEmail", {
-		method: "POST", headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ mailboxId, emailId: messageId, sender: (parsedEmail.from?.address || "").toLowerCase(), subject: parsedEmail.subject || "", threadId }),
-	})).catch((e) => console.error("Auto-draft trigger failed:", (e as Error).message)));
+	await stub.scheduleInboundDraft({
+		operationId: claim.operation.id,
+		mailboxId,
+		emailId: messageId,
+		sender: (parsedEmail.from?.address || "").toLowerCase(),
+		subject: parsedEmail.subject || "",
+		threadId,
+	});
 }
 
 export { app, receiveEmail };

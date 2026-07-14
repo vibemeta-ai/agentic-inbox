@@ -42,3 +42,24 @@ export const attachments = sqliteTable("attachments", {
 	content_id: text("content_id"),
 	disposition: text("disposition"),
 });
+
+export const inboundOperations = sqliteTable("inbound_operations", {
+	id: text("id").primaryKey(),
+	external_identity: text("external_identity").notNull().unique(),
+	payload_hash: text("payload_hash").notNull(),
+	email_id: text("email_id").notNull().unique(),
+	state: text("state").notNull(),
+	intake_attempts: integer("intake_attempts").notNull().default(0),
+	attachment_manifest: text("attachment_manifest"),
+	last_intake_error: text("last_intake_error"),
+	last_intake_failed_at: text("last_intake_failed_at"),
+	pending_agent_trigger: text("pending_agent_trigger"),
+	current_draft_id: text("current_draft_id"),
+	last_error: text("last_error"),
+	agent_attempts: integer("agent_attempts").notNull().default(0),
+	conflict_count: integer("conflict_count").notNull().default(0),
+	last_conflict_payload_hash: text("last_conflict_payload_hash"),
+	last_conflict_at: text("last_conflict_at"),
+	created_at: text("created_at").notNull(),
+	updated_at: text("updated_at").notNull(),
+});
