@@ -27,6 +27,7 @@ import {
 	normalizeMessageIdentity,
 } from "./lib/inbound-identity";
 import { hasValidTeachingAdminToken } from "./lib/teaching-auth";
+import { getEmailAgentStub } from "./lib/agent-connection";
 
 type AppContext = Context<MailboxContext>;
 
@@ -241,7 +242,7 @@ app.post(VM_1007_RESET_PATH, async (c) => {
 	}
 	const removed = await mailbox.resetTeachingScenario();
 
-	const agent = c.env.EMAIL_AGENT.get(c.env.EMAIL_AGENT.idFromName(mailboxId));
+	const agent = await getEmailAgentStub(c.env.EMAIL_AGENT, mailboxId);
 	const agentReset = await agent.fetch(new Request("https://agents/resetTeachingScenario", {
 		method: "POST",
 		headers: {

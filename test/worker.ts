@@ -14,6 +14,15 @@ interface FakeAgentTrigger {
 export class FakeEmailAgent extends DurableObject {
 	async fetch(request: Request) {
 		const url = new URL(request.url);
+		if (url.pathname === "/cdn-cgi/partyserver/set-name/" && request.method === "GET") {
+			const room = request.headers.get("x-partykit-room");
+			if (!room) return new Response("Missing Agent room", { status: 400 });
+			const namedConnectionCount =
+				(await this.ctx.storage.get<number>("namedConnectionCount")) ?? 0;
+			await this.ctx.storage.put("namedConnectionCount", namedConnectionCount + 1);
+			await this.ctx.storage.put("lastNamedRoom", room);
+			return Response.json({ ok: true });
+		}
 		if (url.pathname === "/resetTeachingScenario" && request.method === "POST") {
 			if (request.headers.get("Authorization") !== "Bearer synthetic-teaching-admin-token") {
 				return new Response("Forbidden", { status: 403 });
@@ -66,6 +75,13 @@ export class FakeEmailAgent extends DurableObject {
 
 	async getTriggerCount() {
 		return (await this.ctx.storage.get<number>("triggerCount")) ?? 0;
+	}
+
+	async getNamedConnectionStats() {
+		return {
+			count: (await this.ctx.storage.get<number>("namedConnectionCount")) ?? 0,
+			lastRoom: await this.ctx.storage.get<string>("lastNamedRoom"),
+		};
 	}
 }
 
