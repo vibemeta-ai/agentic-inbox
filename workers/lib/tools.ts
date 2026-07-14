@@ -120,6 +120,7 @@ export async function toolDraftReply(
 	env: Env,
 	mailboxId: string,
 	params: {
+		operationId?: string;
 		originalEmailId: string;
 		to: string;
 		subject: string;
@@ -128,7 +129,7 @@ export async function toolDraftReply(
 		runVerifyDraft?: boolean;
 	},
 ): Promise<
-	| { status: "draft_saved"; draftId: string; message: string; draft: Record<string, string> }
+	| { status: "draft_saved" | "draft_reused"; draftId: string; message: string; draft: Record<string, string> }
 	| { error: string }
 > {
 	const stub = getMailboxStub(env, mailboxId);
@@ -148,8 +149,6 @@ export async function toolDraftReply(
 		processedBody = textToHtml(processedBody);
 	}
 
-	const draftId = crypto.randomUUID();
-
 	// Get the original email for thread_id and quoted text
 	const original = (await stub.getEmail(params.originalEmailId)) as EmailFull | null;
 	const threadId = original?.thread_id || params.originalEmailId;
@@ -163,11 +162,12 @@ export async function toolDraftReply(
 			})
 		: "";
 	const bodyHtml = processedBody + quotedBlock;
-
-	await stub.createEmail(
-		Folders.DRAFT,
-		{
-			id: draftId,
+	let draftId: string;
+	let status: "draft_saved" | "draft_reused" = "draft_saved";
+	if (params.operationId) {
+		const committed = await stub.commitCurrentDraft({
+			operationId: params.operationId,
+			draft: {
 			subject: params.subject,
 			sender: mailboxId.toLowerCase(),
 			recipient: params.to.toLowerCase(),
@@ -177,13 +177,35 @@ export async function toolDraftReply(
 			email_references: null,
 			thread_id: threadId,
 		},
-		[],
-	);
+		});
+		draftId = committed.draftId;
+		status = committed.kind === "replay" ? "draft_reused" : "draft_saved";
+	} else {
+		draftId = crypto.randomUUID();
+		await stub.createEmail(
+			Folders.DRAFT,
+			{
+				id: draftId,
+				subject: params.subject,
+				sender: mailboxId.toLowerCase(),
+				recipient: params.to.toLowerCase(),
+				date: new Date().toISOString(),
+				body: bodyHtml,
+				in_reply_to: params.originalEmailId,
+				email_references: null,
+				thread_id: threadId,
+			},
+			[],
+		);
+	}
 
 	return {
-		status: "draft_saved",
+		status,
 		draftId,
-		message: "Draft saved to Drafts folder. Review it and confirm to send.",
+		message:
+			status === "draft_reused"
+				? "The operation already has a current Draft. Review that Draft before continuing."
+				: "Draft saved to Drafts folder. Review it and confirm to send.",
 		draft: {
 			originalEmailId: params.originalEmailId,
 			to: params.to,
@@ -291,8 +313,7 @@ export async function toolUpdateDraft(
 		return { error: "Draft not found" };
 	}
 
-	// Verify the body BEFORE deleting the old draft to prevent data loss
-	const newDraftId = crypto.randomUUID();
+	// Verify the body before changing the current Draft.
 	const rawBody = params.bodyHtml ?? oldDraft.body ?? "";
 	const verifiedBody = await verifyDraft(env.AI, rawBody);
 
@@ -300,26 +321,24 @@ export async function toolUpdateDraft(
 		return { error: "Draft verification failed — keeping existing draft unchanged. Please try again." };
 	}
 
-	await stub.deleteEmail(params.draftId);
-	await stub.createEmail(
-		Folders.DRAFT,
-		{
-			id: newDraftId,
-			subject: params.subject ?? oldDraft.subject,
-			sender: mailboxId.toLowerCase(),
-			recipient: (params.to ?? oldDraft.recipient).toLowerCase(),
-			date: new Date().toISOString(),
-			body: verifiedBody,
-			in_reply_to: oldDraft.in_reply_to || null,
-			email_references: oldDraft.email_references || null,
-			thread_id: oldDraft.thread_id || newDraftId,
-		},
-		[],
-	);
+	await stub.updateDraft(params.draftId, {
+		subject: params.subject ?? oldDraft.subject,
+		sender: mailboxId.toLowerCase(),
+		recipient: (params.to ?? oldDraft.recipient).toLowerCase(),
+		cc: oldDraft.cc || null,
+		bcc: oldDraft.bcc || null,
+		date: new Date().toISOString(),
+		body: verifiedBody,
+		in_reply_to: oldDraft.in_reply_to || null,
+		email_references: oldDraft.email_references || null,
+		thread_id: oldDraft.thread_id || params.draftId,
+		message_id: oldDraft.message_id || null,
+		raw_headers: oldDraft.raw_headers || null,
+	});
 
 	return {
 		status: "draft_updated",
-		newDraftId,
+		newDraftId: params.draftId,
 		oldDraftId: params.draftId,
 		message: "Draft updated in Drafts folder.",
 	};
@@ -369,7 +388,8 @@ export async function toolDiscardDraft(
 	if (email.folder_id !== Folders.DRAFT) {
 		return { error: "Cannot discard: email is not a draft" };
 	}
-	await stub.deleteEmail(draftId);
+	const rejected = await stub.rejectCurrentDraft(draftId);
+	if (!rejected) await stub.deleteEmail(draftId);
 	return { status: "discarded", draftId };
 }
 
@@ -384,6 +404,13 @@ export async function toolDeleteEmail(
 	const result = await stub.deleteEmail(emailId);
 	if (result === null) {
 		return { error: "Email not found", emailId };
+	}
+	if (result.kind === "blocked") {
+		return {
+			error: "Cannot delete the source request while its durable operation is retained",
+			emailId,
+			operationId: result.operationId,
+		};
 	}
 	return { status: "deleted", emailId };
 }

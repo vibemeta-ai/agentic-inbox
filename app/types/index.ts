@@ -59,6 +59,45 @@ export interface Attachment {
 	disposition?: string;
 }
 
+export interface InboundOperation {
+	id: string;
+	externalIdentity: string;
+	payloadHash: string;
+	emailId: string;
+	state:
+		| "received"
+		| "storing_attachments"
+		| "intake_failed"
+		| "intake_committed"
+		| "drafting"
+		| "draft_failed"
+		| "awaiting_human_review"
+		| "rejected"
+		| "approved"
+		| "delivery_pending"
+		| "sent"
+		| "delivery_failed";
+	intakeAttempts: number;
+	attachmentManifest: Array<{
+		id: string;
+		key: string;
+		filename: string;
+		size: number;
+		mimetype: string;
+	}>;
+	lastIntakeError: string | null;
+	lastIntakeFailedAt: string | null;
+	agentTriggerPending: boolean;
+	currentDraftId: string | null;
+	lastError: string | null;
+	agentAttempts: number;
+	conflictCount: number;
+	lastConflictPayloadHash: string | null;
+	lastConflictAt: string | null;
+	createdAt: string;
+	updatedAt: string;
+}
+
 export interface Folder {
 	id: string;
 	name: string;

@@ -14,10 +14,15 @@
 	},
 	"scripts": {
 		"build": "react-router build",
+		"build:reference": "VIBE_META_WRANGLER_CONFIG=wrangler.reference.jsonc react-router build",
 		"cf-typegen": "wrangler types",
 		"deploy": "npm run build && wrangler deploy",
+		"deploy:reference": "npm run build:reference && wrangler deploy --config build/server/wrangler.json",
 		"dev": "react-router dev",
+		"dev:reference": "VIBE_META_WRANGLER_CONFIG=wrangler.reference.jsonc react-router dev",
 		"preview": "npm run build && vite preview",
+		"reference:dry-run": "npm run build:reference && wrangler deploy --dry-run --config build/server/wrangler.json --outdir .wrangler/reference-dry-run",
+		"test": "vitest run",
 		"typecheck": "npm run cf-typegen && react-router typegen && tsc -b"
 	},
 	"dependencies": {
@@ -82,6 +87,7 @@
 	},
 	"devDependencies": {
 		"@cloudflare/vite-plugin": "^1.0.12",
+		"@cloudflare/vitest-pool-workers": "^0.18.4",
 		"@cloudflare/workers-types": "^4.20251128.0",
 		"@react-router/dev": "^7.5.3",
 		"@tailwindcss/vite": "^4.1.4",
@@ -93,6 +99,7 @@
 		"typescript": "^5.8.3",
 		"vite": "^6.3.3",
 		"vite-tsconfig-paths": "^5.1.4",
+		"vitest": "^4.1.10",
 		"wrangler": "^4.74.0"
 	}
 }

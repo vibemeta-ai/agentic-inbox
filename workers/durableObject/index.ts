@@ -33,6 +33,8 @@ const ALLOWED_SORT_COLUMNS = [
 	"starred",
 ] as const;
 
+const INBOUND_INTAKE_LEASE_MS = 60_000;
+
 type SortColumn = (typeof ALLOWED_SORT_COLUMNS)[number];
 
 /**
@@ -99,6 +101,121 @@ interface AttachmentData {
 	disposition?: string | null;
 }
 
+interface InboundOperationInput {
+	externalIdentity: string;
+	payloadHash: string;
+}
+
+interface CommitInboundOperationInput {
+	operationId: string;
+	email: Omit<EmailData, "id">;
+	attachments: Array<Omit<AttachmentData, "email_id">>;
+}
+
+interface InboundAttachmentManifestEntry {
+	id: string;
+	key: string;
+	filename: string;
+	size: number;
+	mimetype: string;
+}
+
+interface PrepareInboundIntakeInput {
+	operationId: string;
+	attachmentManifest: InboundAttachmentManifestEntry[];
+}
+
+interface CommitCurrentDraftInput {
+	operationId: string;
+	draft: Omit<EmailData, "id">;
+}
+
+interface InboundAgentTrigger {
+	operationId: string;
+	mailboxId: string;
+	emailId: string;
+	sender: string;
+	subject: string;
+	threadId: string;
+	operationStarted: true;
+}
+
+interface InboundOperation {
+	id: string;
+	externalIdentity: string;
+	payloadHash: string;
+	emailId: string;
+	state: string;
+	intakeAttempts: number;
+	attachmentManifest: InboundAttachmentManifestEntry[];
+	lastIntakeError: string | null;
+	lastIntakeFailedAt: string | null;
+	agentTriggerPending: boolean;
+	currentDraftId: string | null;
+	lastError: string | null;
+	agentAttempts: number;
+	conflictCount: number;
+	lastConflictPayloadHash: string | null;
+	lastConflictAt: string | null;
+	createdAt: string;
+	updatedAt: string;
+}
+
+interface InboundOperationRow {
+	id: string;
+	external_identity: string;
+	payload_hash: string;
+	email_id: string;
+	state: string;
+	intake_attempts: number;
+	attachment_manifest: string | null;
+	last_intake_error: string | null;
+	last_intake_failed_at: string | null;
+	pending_agent_trigger: string | null;
+	current_draft_id: string | null;
+	last_error: string | null;
+	agent_attempts: number;
+	conflict_count: number;
+	last_conflict_payload_hash: string | null;
+	last_conflict_at: string | null;
+	created_at: string;
+	updated_at: string;
+}
+
+function toInboundOperation(row: InboundOperationRow): InboundOperation {
+	return {
+		id: row.id,
+		externalIdentity: row.external_identity,
+		payloadHash: row.payload_hash,
+		emailId: row.email_id,
+		state: row.state,
+		intakeAttempts: row.intake_attempts,
+		attachmentManifest: row.attachment_manifest
+			? JSON.parse(row.attachment_manifest) as InboundAttachmentManifestEntry[]
+			: [],
+		lastIntakeError: row.last_intake_error,
+		lastIntakeFailedAt: row.last_intake_failed_at,
+		agentTriggerPending: row.pending_agent_trigger !== null,
+		currentDraftId: row.current_draft_id,
+		lastError: row.last_error,
+		agentAttempts: row.agent_attempts,
+		conflictCount: row.conflict_count,
+		lastConflictPayloadHash: row.last_conflict_payload_hash,
+		lastConflictAt: row.last_conflict_at,
+		createdAt: row.created_at,
+		updatedAt: row.updated_at,
+	};
+}
+
+async function stableId(prefix: string, value: string): Promise<string> {
+	const bytes = new TextEncoder().encode(value);
+	const digest = await crypto.subtle.digest("SHA-256", bytes);
+	const hex = Array.from(new Uint8Array(digest), (byte) =>
+		byte.toString(16).padStart(2, "0"),
+	).join("");
+	return `${prefix}_${hex}`;
+}
+
 export class MailboxDO extends DurableObject<Env> {
 	declare __DURABLE_OBJECT_BRAND: never;
 	db: ReturnType<typeof drizzle>;
@@ -107,6 +224,794 @@ export class MailboxDO extends DurableObject<Env> {
 		super(state, env);
 		this.db = drizzle(this.ctx.storage, { schema });
 		applyMigrations(this.ctx.storage.sql, mailboxMigrations, this.ctx.storage);
+	}
+
+	async claimInboundOperation(input: InboundOperationInput) {
+		const externalIdentity = input.externalIdentity.trim().toLowerCase();
+		const payloadHash = input.payloadHash.trim().toLowerCase();
+
+		if (!externalIdentity || externalIdentity.length > 1024) {
+			throw new TypeError("externalIdentity must be between 1 and 1024 characters");
+		}
+		if (!payloadHash || payloadHash.length > 256) {
+			throw new TypeError("payloadHash must be between 1 and 256 characters");
+		}
+
+		const operationId = await stableId("inbound", externalIdentity);
+		const emailId = await stableId("email", externalIdentity);
+
+		return this.ctx.storage.transactionSync(() => {
+			const existing = [
+				...this.ctx.storage.sql.exec(
+					"SELECT * FROM inbound_operations WHERE external_identity = ?1",
+					externalIdentity,
+				),
+			][0] as unknown as InboundOperationRow | undefined;
+
+			if (existing) {
+				if (existing.payload_hash !== payloadHash) {
+					const now = new Date().toISOString();
+					this.ctx.storage.sql.exec(
+						`UPDATE inbound_operations
+						 SET conflict_count = conflict_count + 1,
+						     last_conflict_payload_hash = ?2,
+						     last_conflict_at = ?3,
+						     updated_at = ?3
+						 WHERE id = ?1`,
+						existing.id,
+						payloadHash,
+						now,
+					);
+					const conflicted = [
+						...this.ctx.storage.sql.exec(
+							"SELECT * FROM inbound_operations WHERE id = ?1",
+							existing.id,
+						),
+					][0] as unknown as InboundOperationRow;
+					return {
+						kind: "conflict",
+						operation: toInboundOperation(conflicted),
+					};
+				}
+				return {
+					kind: "replay",
+					operation: toInboundOperation(existing),
+				};
+			}
+
+			const now = new Date().toISOString();
+			this.ctx.storage.sql.exec(
+				`INSERT INTO inbound_operations (
+					id, external_identity, payload_hash, email_id, state,
+					current_draft_id, last_error, agent_attempts, conflict_count,
+					last_conflict_payload_hash, last_conflict_at, created_at, updated_at
+				) VALUES (
+					?1, ?2, ?3, ?4, 'received', NULL, NULL, 0, 0,
+					NULL, NULL, ?5, ?5
+				)`,
+				operationId,
+				externalIdentity,
+				payloadHash,
+				emailId,
+				now,
+			);
+
+			const created = [
+				...this.ctx.storage.sql.exec(
+					"SELECT * FROM inbound_operations WHERE id = ?1",
+					operationId,
+				),
+			][0] as unknown as InboundOperationRow;
+
+			return {
+				kind: "created",
+				operation: toInboundOperation(created),
+			};
+		});
+	}
+
+	async prepareInboundIntake(input: PrepareInboundIntakeInput) {
+		if (!input.operationId) throw new TypeError("operationId is required");
+		if (input.attachmentManifest.length > 100) {
+			throw new TypeError("attachmentManifest exceeds 100 entries");
+		}
+		const manifest = JSON.stringify(input.attachmentManifest);
+		if (manifest.length > 64 * 1024) {
+			throw new TypeError("attachmentManifest exceeds 64 KiB");
+		}
+
+		return this.ctx.storage.transactionSync(() => {
+			const existing = [
+				...this.ctx.storage.sql.exec(
+					"SELECT * FROM inbound_operations WHERE id = ?1",
+					input.operationId,
+				),
+			][0] as unknown as InboundOperationRow | undefined;
+
+			if (!existing) throw new Error("Inbound operation not found");
+			for (const attachment of input.attachmentManifest) {
+				const expectedKey =
+					`attachments/${existing.email_id}/${attachment.id}/${attachment.filename}`;
+				if (attachment.key !== expectedKey) {
+					throw new TypeError("attachmentManifest contains an invalid R2 key");
+				}
+				if (
+					!attachment.id ||
+					!attachment.filename ||
+					!attachment.mimetype ||
+					!Number.isInteger(attachment.size) ||
+					attachment.size < 0
+				) {
+					throw new TypeError("attachmentManifest contains invalid metadata");
+				}
+			}
+				const activeIntakeLease =
+					existing.state === "storing_attachments" &&
+					Date.now() - Date.parse(existing.updated_at) < INBOUND_INTAKE_LEASE_MS;
+				if (
+					activeIntakeLease ||
+					(
+						existing.state !== "received" &&
+						existing.state !== "storing_attachments" &&
+						existing.state !== "intake_failed"
+					)
+				) {
+				return {
+					kind: "replay",
+					operation: toInboundOperation(existing),
+				};
+			}
+
+			const now = new Date().toISOString();
+			this.ctx.storage.sql.exec(
+				`UPDATE inbound_operations
+				 SET state = 'storing_attachments',
+				     intake_attempts = intake_attempts + 1,
+				     attachment_manifest = ?2,
+				     last_error = NULL,
+				     updated_at = ?3
+				 WHERE id = ?1`,
+				input.operationId,
+				manifest,
+				now,
+			);
+			const prepared = [
+				...this.ctx.storage.sql.exec(
+					"SELECT * FROM inbound_operations WHERE id = ?1",
+					input.operationId,
+				),
+			][0] as unknown as InboundOperationRow;
+
+			return {
+				kind: "prepared",
+				operation: toInboundOperation(prepared),
+			};
+		});
+	}
+
+	async failInboundIntake(operationId: string, error: string) {
+		const failure = error.trim().slice(0, 1000) || "unknown_intake_failure";
+		return this.ctx.storage.transactionSync(() => {
+			const existing = [
+				...this.ctx.storage.sql.exec(
+					"SELECT * FROM inbound_operations WHERE id = ?1",
+					operationId,
+				),
+			][0] as unknown as InboundOperationRow | undefined;
+
+			if (!existing) throw new Error("Inbound operation not found");
+			if (
+				existing.state !== "received" &&
+				existing.state !== "storing_attachments" &&
+				existing.state !== "intake_failed"
+			) {
+				return {
+					kind: "replay",
+					operation: toInboundOperation(existing),
+				};
+			}
+
+			const now = new Date().toISOString();
+			this.ctx.storage.sql.exec(
+				`UPDATE inbound_operations
+				 SET state = 'intake_failed', last_error = ?2,
+				     last_intake_error = ?2, last_intake_failed_at = ?3,
+				     updated_at = ?3
+				 WHERE id = ?1`,
+				operationId,
+				failure,
+				now,
+			);
+			const failed = [
+				...this.ctx.storage.sql.exec(
+					"SELECT * FROM inbound_operations WHERE id = ?1",
+					operationId,
+				),
+			][0] as unknown as InboundOperationRow;
+
+			return {
+				kind: "failed",
+				operation: toInboundOperation(failed),
+			};
+		});
+	}
+
+	async commitInboundOperation(input: CommitInboundOperationInput) {
+		if (!input.operationId) {
+			throw new TypeError("operationId is required");
+		}
+
+		return this.ctx.storage.transactionSync(() => {
+			const existing = [
+				...this.ctx.storage.sql.exec(
+					"SELECT * FROM inbound_operations WHERE id = ?1",
+					input.operationId,
+				),
+			][0] as unknown as InboundOperationRow | undefined;
+
+			if (!existing) {
+				throw new Error("Inbound operation not found");
+			}
+
+			if (existing.state !== "storing_attachments") {
+				if (
+					existing.state === "intake_committed" ||
+					existing.state === "drafting" ||
+					existing.state === "draft_failed" ||
+					existing.state === "awaiting_human_review"
+				) {
+					return {
+						kind: "replay",
+						operation: toInboundOperation(existing),
+					};
+				}
+				throw new Error(`Cannot commit intake from state ${existing.state}`);
+			}
+
+			const email = input.email;
+			this.ctx.storage.sql.exec(
+				`INSERT INTO emails (
+					id, folder_id, subject, sender, recipient, cc, bcc, date,
+					read, starred, body, in_reply_to, email_references,
+					thread_id, message_id, raw_headers
+				) VALUES (
+					?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+					?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+				)`,
+				existing.email_id,
+				Folders.INBOX,
+				email.subject,
+				email.sender,
+				email.recipient,
+				email.cc ?? null,
+				email.bcc ?? null,
+				email.date,
+				email.read ? 1 : 0,
+				email.starred ? 1 : 0,
+				email.body,
+				email.in_reply_to ?? null,
+				email.email_references ?? null,
+				email.thread_id ?? existing.email_id,
+				email.message_id ?? null,
+				email.raw_headers ?? null,
+			);
+
+			for (const attachment of input.attachments) {
+				this.ctx.storage.sql.exec(
+					`INSERT INTO attachments (
+						id, email_id, filename, mimetype, size, content_id, disposition
+					) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+					attachment.id,
+					existing.email_id,
+					attachment.filename,
+					attachment.mimetype,
+					attachment.size,
+					attachment.content_id ?? null,
+					attachment.disposition ?? null,
+				);
+			}
+
+			const now = new Date().toISOString();
+			this.ctx.storage.sql.exec(
+				`UPDATE inbound_operations
+				 SET state = 'intake_committed', updated_at = ?2
+				 WHERE id = ?1`,
+				input.operationId,
+				now,
+			);
+
+			const committed = [
+				...this.ctx.storage.sql.exec(
+					"SELECT * FROM inbound_operations WHERE id = ?1",
+					input.operationId,
+				),
+			][0] as unknown as InboundOperationRow;
+
+			return {
+				kind: "committed",
+				operation: toInboundOperation(committed),
+			};
+		});
+	}
+
+	async getInboundOperation(operationId: string) {
+		const row = [
+			...this.ctx.storage.sql.exec(
+				"SELECT * FROM inbound_operations WHERE id = ?1",
+				operationId,
+			),
+		][0] as unknown as InboundOperationRow | undefined;
+		return row ? toInboundOperation(row) : null;
+	}
+
+	async getInboundOperationByEmailId(emailId: string) {
+		const row = [
+			...this.ctx.storage.sql.exec(
+				`SELECT * FROM inbound_operations
+				 WHERE email_id = ?1 OR current_draft_id = ?1
+				 LIMIT 1`,
+				emailId,
+			),
+		][0] as unknown as InboundOperationRow | undefined;
+		return row ? toInboundOperation(row) : null;
+	}
+
+	async getTeachingResetPlan() {
+		const attachments = [
+			...this.ctx.storage.sql.exec(
+				"SELECT email_id, id, filename FROM attachments ORDER BY email_id, id",
+			),
+		] as unknown as Array<{
+			email_id: string;
+			id: string;
+			filename: string;
+		}>;
+		const manifestRows = [
+			...this.ctx.storage.sql.exec(
+				`SELECT attachment_manifest
+				 FROM inbound_operations
+				 WHERE attachment_manifest IS NOT NULL`,
+			),
+		] as unknown as Array<{ attachment_manifest: string }>;
+		const attachmentKeys = new Set(
+			attachments.map(
+				(attachment) =>
+					`attachments/${attachment.email_id}/${attachment.id}/${attachment.filename}`,
+			),
+		);
+		for (const row of manifestRows) {
+			const manifest = JSON.parse(
+				row.attachment_manifest,
+			) as InboundAttachmentManifestEntry[];
+			for (const attachment of manifest) {
+				if (attachment.key.startsWith("attachments/")) {
+					attachmentKeys.add(attachment.key);
+				}
+			}
+		}
+		return {
+			attachmentKeys: [...attachmentKeys].sort(),
+		};
+	}
+
+	async listInboundOperations(limit = 100) {
+		const boundedLimit = Math.min(Math.max(Math.trunc(limit), 1), 100);
+		const rows = [
+			...this.ctx.storage.sql.exec(
+				`SELECT * FROM inbound_operations
+				 ORDER BY updated_at DESC
+				 LIMIT ?1`,
+				boundedLimit,
+			),
+		] as unknown as InboundOperationRow[];
+		return rows.map(toInboundOperation);
+	}
+
+	async resetTeachingScenario() {
+		return this.ctx.storage.transactionSync(() => {
+			const counts = {
+				operations: [
+					...this.ctx.storage.sql.exec(
+						"SELECT COUNT(*) AS count FROM inbound_operations",
+					),
+				][0] as unknown as { count: number },
+				emails: [
+					...this.ctx.storage.sql.exec("SELECT COUNT(*) AS count FROM emails"),
+				][0] as unknown as { count: number },
+			};
+			this.ctx.storage.sql.exec("DELETE FROM attachments");
+			this.ctx.storage.sql.exec("DELETE FROM emails");
+			this.ctx.storage.sql.exec("DELETE FROM inbound_operations");
+			this.ctx.storage.sql.exec("DELETE FROM folders WHERE is_deletable = 1");
+			return {
+				removedOperations: counts.operations.count,
+				removedEmails: counts.emails.count,
+			};
+		});
+	}
+
+	async startInboundDraft(operationId: string) {
+		return this.ctx.storage.transactionSync(() => {
+			const existing = [
+				...this.ctx.storage.sql.exec(
+					"SELECT * FROM inbound_operations WHERE id = ?1",
+					operationId,
+				),
+			][0] as unknown as InboundOperationRow | undefined;
+
+			if (!existing) throw new Error("Inbound operation not found");
+			if (existing.current_draft_id || existing.state === "awaiting_human_review") {
+				return {
+					kind: "replay",
+					operation: toInboundOperation(existing),
+				};
+			}
+			if (existing.state === "drafting") {
+				return {
+					kind: "replay",
+					operation: toInboundOperation(existing),
+				};
+			}
+			if (
+				existing.state !== "intake_committed" &&
+				existing.state !== "draft_failed"
+			) {
+				throw new Error(`Cannot start Draft from state ${existing.state}`);
+			}
+
+			const now = new Date().toISOString();
+			this.ctx.storage.sql.exec(
+				`UPDATE inbound_operations
+				 SET state = 'drafting', last_error = NULL,
+				     agent_attempts = agent_attempts + 1, updated_at = ?2
+				 WHERE id = ?1`,
+				operationId,
+				now,
+			);
+			const started = [
+				...this.ctx.storage.sql.exec(
+					"SELECT * FROM inbound_operations WHERE id = ?1",
+					operationId,
+				),
+			][0] as unknown as InboundOperationRow;
+
+			return {
+				kind: "started",
+				operation: toInboundOperation(started),
+			};
+		});
+	}
+
+	async scheduleInboundDraft(trigger: Omit<InboundAgentTrigger, "operationStarted">) {
+		const queuedTrigger: InboundAgentTrigger = {
+			...trigger,
+			operationStarted: true,
+		};
+		const scheduled = this.ctx.storage.transactionSync(() => {
+			const existing = [
+				...this.ctx.storage.sql.exec(
+					"SELECT * FROM inbound_operations WHERE id = ?1",
+					trigger.operationId,
+				),
+			][0] as unknown as InboundOperationRow | undefined;
+
+			if (!existing) throw new Error("Inbound operation not found");
+			if (
+				existing.current_draft_id ||
+				existing.state === "awaiting_human_review" ||
+				existing.state === "rejected" ||
+				existing.state === "drafting"
+			) {
+				return {
+					kind: "replay" as const,
+					operation: toInboundOperation(existing),
+				};
+			}
+			if (
+				existing.state !== "intake_committed" &&
+				existing.state !== "draft_failed"
+			) {
+				throw new Error(`Cannot schedule Draft from state ${existing.state}`);
+			}
+
+			const now = new Date().toISOString();
+			this.ctx.storage.sql.exec(
+				`UPDATE inbound_operations
+				 SET state = 'drafting', last_error = NULL,
+				     agent_attempts = agent_attempts + 1,
+				     pending_agent_trigger = ?2, updated_at = ?3
+				 WHERE id = ?1`,
+				trigger.operationId,
+				JSON.stringify(queuedTrigger),
+				now,
+			);
+			const row = [
+				...this.ctx.storage.sql.exec(
+					"SELECT * FROM inbound_operations WHERE id = ?1",
+					trigger.operationId,
+				),
+			][0] as unknown as InboundOperationRow;
+			return {
+				kind: "scheduled" as const,
+				operation: toInboundOperation(row),
+			};
+		});
+
+		if (scheduled.kind === "scheduled") {
+			try {
+				await this.ctx.storage.setAlarm(Date.now() + 1_000);
+			} catch (error) {
+				await this.failInboundDraft(
+					trigger.operationId,
+					`agent_schedule_failed:${error instanceof Error ? error.message : String(error)}`,
+				);
+				throw error;
+			}
+		}
+		return scheduled;
+	}
+
+	async alarm() {
+		const row = [
+			...this.ctx.storage.sql.exec(
+				`SELECT * FROM inbound_operations
+				 WHERE pending_agent_trigger IS NOT NULL
+				 ORDER BY updated_at ASC
+				 LIMIT 1`,
+			),
+		][0] as unknown as InboundOperationRow | undefined;
+		if (!row?.pending_agent_trigger) return;
+
+		const trigger = JSON.parse(row.pending_agent_trigger) as InboundAgentTrigger;
+		try {
+			const agent = this.env.EMAIL_AGENT.get(
+				this.env.EMAIL_AGENT.idFromName(trigger.mailboxId),
+			);
+			const response = await agent.fetch(new Request("https://agents/onNewEmail", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(trigger),
+			}));
+			if (!response.ok) throw new Error(`agent_trigger_http_${response.status}`);
+
+			const current = await this.getInboundOperation(trigger.operationId);
+			if (current?.state === "drafting") {
+				throw new Error("agent_completed_without_state_transition");
+			}
+		} catch (error) {
+			await this.failInboundDraft(
+				trigger.operationId,
+				error instanceof Error ? error.message : String(error),
+			);
+		}
+
+		const pending = [
+			...this.ctx.storage.sql.exec(
+				`SELECT 1 FROM inbound_operations
+				 WHERE pending_agent_trigger IS NOT NULL
+				 LIMIT 1`,
+			),
+		];
+		if (pending.length > 0) await this.ctx.storage.setAlarm(Date.now() + 1_000);
+	}
+
+	async failInboundDraft(operationId: string, error: string) {
+		const lastError = error.trim().slice(0, 1000) || "unknown_agent_failure";
+		return this.ctx.storage.transactionSync(() => {
+			const existing = [
+				...this.ctx.storage.sql.exec(
+					"SELECT * FROM inbound_operations WHERE id = ?1",
+					operationId,
+				),
+			][0] as unknown as InboundOperationRow | undefined;
+
+			if (!existing) throw new Error("Inbound operation not found");
+			if (existing.current_draft_id || existing.state === "awaiting_human_review") {
+				return {
+					kind: "replay",
+					operation: toInboundOperation(existing),
+				};
+			}
+			if (existing.state === "draft_failed") {
+				return {
+					kind: "replay",
+					operation: toInboundOperation(existing),
+				};
+			}
+			if (
+				existing.state !== "intake_committed" &&
+				existing.state !== "drafting"
+			) {
+				throw new Error(`Cannot fail Draft from state ${existing.state}`);
+			}
+
+			const now = new Date().toISOString();
+			this.ctx.storage.sql.exec(
+				`UPDATE inbound_operations
+				 SET state = 'draft_failed', last_error = ?2,
+				     pending_agent_trigger = NULL, updated_at = ?3
+				 WHERE id = ?1`,
+				operationId,
+				lastError,
+				now,
+			);
+			const failed = [
+				...this.ctx.storage.sql.exec(
+					"SELECT * FROM inbound_operations WHERE id = ?1",
+					operationId,
+				),
+			][0] as unknown as InboundOperationRow;
+
+			return {
+				kind: "failed",
+				operation: toInboundOperation(failed),
+			};
+		});
+	}
+
+	async commitCurrentDraft(input: CommitCurrentDraftInput) {
+		const draftId = await stableId("draft", input.operationId);
+		return this.ctx.storage.transactionSync(() => {
+			const existing = [
+				...this.ctx.storage.sql.exec(
+					"SELECT * FROM inbound_operations WHERE id = ?1",
+					input.operationId,
+				),
+			][0] as unknown as InboundOperationRow | undefined;
+
+			if (!existing) throw new Error("Inbound operation not found");
+			if (existing.current_draft_id) {
+				return {
+					kind: "replay",
+					draftId: existing.current_draft_id,
+					operation: toInboundOperation(existing),
+				};
+			}
+			if (existing.state !== "drafting") {
+				throw new Error(`Cannot commit Draft from state ${existing.state}`);
+			}
+
+			const draft = input.draft;
+			this.ctx.storage.sql.exec(
+				`INSERT INTO emails (
+					id, folder_id, subject, sender, recipient, cc, bcc, date,
+					read, starred, body, in_reply_to, email_references,
+					thread_id, message_id, raw_headers
+				) VALUES (
+					?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+					0, 0, ?9, ?10, ?11, ?12, ?13, ?14
+				)`,
+				draftId,
+				Folders.DRAFT,
+				draft.subject,
+				draft.sender,
+				draft.recipient,
+				draft.cc ?? null,
+				draft.bcc ?? null,
+				draft.date,
+				draft.body,
+				draft.in_reply_to ?? existing.email_id,
+				draft.email_references ?? null,
+				draft.thread_id ?? existing.email_id,
+				draft.message_id ?? null,
+				draft.raw_headers ?? null,
+			);
+
+			const now = new Date().toISOString();
+			this.ctx.storage.sql.exec(
+				`UPDATE inbound_operations
+				 SET state = 'awaiting_human_review', current_draft_id = ?2,
+				     last_error = NULL, pending_agent_trigger = NULL, updated_at = ?3
+				 WHERE id = ?1`,
+				input.operationId,
+				draftId,
+				now,
+			);
+			const committed = [
+				...this.ctx.storage.sql.exec(
+					"SELECT * FROM inbound_operations WHERE id = ?1",
+					input.operationId,
+				),
+			][0] as unknown as InboundOperationRow;
+
+			return {
+				kind: "committed",
+				draftId,
+				operation: toInboundOperation(committed),
+			};
+		});
+	}
+
+	async updateDraft(id: string, draft: Omit<EmailData, "id">) {
+		return this.ctx.storage.transactionSync(() => {
+			const existing = [
+				...this.ctx.storage.sql.exec(
+					"SELECT folder_id FROM emails WHERE id = ?1",
+					id,
+				),
+			][0] as { folder_id: string } | undefined;
+			if (!existing || existing.folder_id !== Folders.DRAFT) return null;
+
+			const operation = [
+				...this.ctx.storage.sql.exec(
+					"SELECT * FROM inbound_operations WHERE current_draft_id = ?1",
+					id,
+				),
+			][0] as unknown as InboundOperationRow | undefined;
+			if (operation && operation.state !== "awaiting_human_review") {
+				throw new Error(`Cannot edit operation Draft from state ${operation.state}`);
+			}
+
+			this.ctx.storage.sql.exec(
+				`UPDATE emails
+				 SET subject = ?2, sender = ?3, recipient = ?4, cc = ?5, bcc = ?6,
+				     date = ?7, body = ?8, in_reply_to = ?9, email_references = ?10,
+				     thread_id = ?11, message_id = ?12, raw_headers = ?13
+				 WHERE id = ?1`,
+				id,
+				draft.subject,
+				draft.sender,
+				draft.recipient,
+				draft.cc ?? null,
+				draft.bcc ?? null,
+				draft.date,
+				draft.body,
+				draft.in_reply_to ?? null,
+				draft.email_references ?? null,
+				draft.thread_id ?? id,
+				draft.message_id ?? null,
+				draft.raw_headers ?? null,
+			);
+			if (operation) {
+				this.ctx.storage.sql.exec(
+					"UPDATE inbound_operations SET updated_at = ?2 WHERE id = ?1",
+					operation.id,
+					new Date().toISOString(),
+				);
+			}
+			return { id, operation: operation ? toInboundOperation(operation) : null };
+		});
+	}
+
+	async rejectCurrentDraft(id: string) {
+		return this.ctx.storage.transactionSync(() => {
+			const operation = [
+				...this.ctx.storage.sql.exec(
+					"SELECT * FROM inbound_operations WHERE current_draft_id = ?1",
+					id,
+				),
+			][0] as unknown as InboundOperationRow | undefined;
+			if (!operation) return null;
+			if (operation.state === "rejected") {
+				return { kind: "replay" as const, operation: toInboundOperation(operation) };
+			}
+			if (operation.state !== "awaiting_human_review") {
+				throw new Error(`Cannot reject Draft from state ${operation.state}`);
+			}
+
+			const now = new Date().toISOString();
+			this.ctx.storage.sql.exec(
+				"UPDATE emails SET folder_id = ?2, date = ?3 WHERE id = ?1",
+				id,
+				Folders.TRASH,
+				now,
+			);
+			this.ctx.storage.sql.exec(
+				`UPDATE inbound_operations
+				 SET state = 'rejected', last_error = NULL,
+				     pending_agent_trigger = NULL, updated_at = ?2
+				 WHERE id = ?1`,
+				operation.id,
+				now,
+			);
+			const rejected = [
+				...this.ctx.storage.sql.exec(
+					"SELECT * FROM inbound_operations WHERE id = ?1",
+					operation.id,
+				),
+			][0] as unknown as InboundOperationRow;
+			return { kind: "rejected" as const, operation: toInboundOperation(rejected) };
+		});
 	}
 
 	// ── Email CRUD (Drizzle) ───────────────────────────────────────
@@ -535,6 +1440,21 @@ export class MailboxDO extends DurableObject<Env> {
 	}
 
 	async deleteEmail(id: string) {
+		const sourceOperation = [
+			...this.ctx.storage.sql.exec(
+				"SELECT id, state FROM inbound_operations WHERE email_id = ?1 LIMIT 1",
+				id,
+			),
+		][0] as { id: string; state: string } | undefined;
+		if (sourceOperation) {
+			return {
+				kind: "blocked" as const,
+				reason: "operation_source" as const,
+				operationId: sourceOperation.id,
+				state: sourceOperation.state,
+			};
+		}
+
 		const email = this.db
 			.select({ id: schema.emails.id })
 			.from(schema.emails)
@@ -557,7 +1477,7 @@ export class MailboxDO extends DurableObject<Env> {
 			.where(eq(schema.emails.id, id))
 			.run();
 
-		return emailAttachments;
+		return { kind: "deleted" as const, attachments: emailAttachments };
 	}
 
 	async getAttachment(id: string) {
@@ -639,6 +1559,15 @@ export class MailboxDO extends DurableObject<Env> {
 			.get();
 
 		if (!folder) return false;
+		const operationDraft = [
+			...this.ctx.storage.sql.exec(
+				`SELECT 1 FROM inbound_operations
+				 WHERE current_draft_id = ?1 AND state = 'awaiting_human_review'
+				 LIMIT 1`,
+				id,
+			),
+		];
+		if (operationDraft.length > 0 && folderId !== Folders.DRAFT) return false;
 
 		this.db
 			.update(schema.emails)

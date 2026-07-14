@@ -2,7 +2,7 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-import type { Email, Folder, Mailbox } from "~/types";
+import type { Email, Folder, InboundOperation, Mailbox } from "~/types";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
@@ -117,6 +117,15 @@ const api = {
 		post<void>(`/api/v1/mailboxes/${mailboxId}/emails`, email),
 	getEmail: (mailboxId: string, id: string, opts?: { signal?: AbortSignal }) =>
 		get<Email>(`/api/v1/mailboxes/${mailboxId}/emails/${id}`, { signal: opts?.signal }),
+	getEmailOperation: (mailboxId: string, id: string, opts?: { signal?: AbortSignal }) =>
+		get<InboundOperation>(
+			`/api/v1/mailboxes/${mailboxId}/emails/${id}/operation`,
+			{ signal: opts?.signal },
+		),
+	retryEmailDraft: (mailboxId: string, id: string) =>
+		post<InboundOperation>(
+			`/api/v1/mailboxes/${mailboxId}/emails/${id}/operation/retry-draft`,
+		),
 	updateEmail: (mailboxId: string, id: string, data: unknown) =>
 		put<Email>(`/api/v1/mailboxes/${mailboxId}/emails/${id}`, data),
 	deleteEmail: (mailboxId: string, id: string) =>

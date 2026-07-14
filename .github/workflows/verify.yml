@@ -43,14 +43,20 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Install locked dependencies
         run: npm ci
+
+      - name: Run deterministic product tests
+        run: npm test
 
       - name: Type-check Worker and application code
         run: npm run typecheck
 
       - name: Build production bundles
         run: npm run build
+
+      - name: Validate reference deployment bundle
+        run: npm run reference:dry-run

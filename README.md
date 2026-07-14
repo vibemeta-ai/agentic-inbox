@@ -60,6 +60,26 @@ npm install
 npm run dev
 ```
 
+### Deterministic VM-1007 teaching scenario
+
+The teaching Admin reset is disabled unless `TEACHING_ADMIN_TOKEN` is set and every request supplies the same value as a Bearer token. For the isolated reference configuration:
+
+```bash
+cp .dev.vars.example .dev.vars
+# Replace the placeholder in .dev.vars with a unique local token.
+npm run dev:reference
+
+curl -X POST http://127.0.0.1:5173/api/v1/teaching/scenarios/vm-1007/reset \
+  -H "Authorization: Bearer <your-local-token>"
+
+curl http://127.0.0.1:5173/api/v1/teaching/scenarios/vm-1007/status \
+  -H "Authorization: Bearer <your-local-token>"
+```
+
+The reset defaults to `{"mode":"normal"}`. An Admin may instead use `{"mode":"draft_failed"}` to seed an explicitly injected recovery state without invoking the Agent. The protected `/replay` and `/conflict` actions re-enter the same inbound function with exact and changed versions of the synthetic MIME fixture. These controls prove application behavior; they do not simulate Email Routing transport or a natural AI provider outage. See `docs/reference-runtime-evidence-plan.md` for the bounded evidence protocol.
+
+The operation deletes only the allowlisted teaching mailbox state and its known R2 attachment keys, resets the mailbox Agent, recreates the mailbox and seeds the synthetic `VM-1007` request through the normal inbound-email path. Repeating it converges on one deterministic email, attachment and operation. Never reuse a deployed token locally.
+
 ### Configuration
 
 1. Set your domain in `wrangler.jsonc`
