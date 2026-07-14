@@ -413,8 +413,12 @@ describe("inbound email product seam", () => {
 		};
 		const agent = env.EMAIL_AGENT.get(
 			env.EMAIL_AGENT.idFromName("lab@inbox.test"),
-		) as unknown as { getTriggerCount(): Promise<number> };
+		) as unknown as {
+			getTriggerCount(): Promise<number>;
+			getNamedConnectionStats(): Promise<{ count: number; lastRoom?: string }>;
+		};
 		const triggerCount = await agent.getTriggerCount();
+		const namedConnectionCount = (await agent.getNamedConnectionStats()).count;
 
 		await deliverSyntheticEmail(
 			env as unknown as Env,
@@ -444,6 +448,10 @@ describe("inbound email product seam", () => {
 			currentDraftId: expect.stringMatching(/^draft_/),
 		});
 		expect(await agent.getTriggerCount()).toBe(triggerCount + 1);
+		expect(await agent.getNamedConnectionStats()).toEqual({
+			count: namedConnectionCount + 1,
+			lastRoom: "lab@inbox.test",
+		});
 	});
 
 	it("records and recovers an acknowledged R2 write without duplicating intake", async () => {
@@ -775,10 +783,16 @@ describe("inbound email product seam", () => {
 			env.EMAIL_AGENT.idFromName("lab@inbox.test"),
 		) as unknown as {
 			getTriggerCount(): Promise<number>;
+			getNamedConnectionStats(): Promise<{ count: number; lastRoom?: string }>;
 		};
+		const namedConnectionCount = (await agent.getNamedConnectionStats()).count;
 
 		const firstResponse = await reset();
 		expect(firstResponse.status).toBe(200);
+		expect(await agent.getNamedConnectionStats()).toEqual({
+			count: namedConnectionCount + 1,
+			lastRoom: "lab@inbox.test",
+		});
 		const first = await firstResponse.json() as {
 			mailboxId: string;
 			emailId: string;
@@ -796,6 +810,10 @@ describe("inbound email product seam", () => {
 		expect(await runDurableObjectAlarm(
 			env.MAILBOX.get(env.MAILBOX.idFromName("lab@inbox.test")),
 		)).toBe(true);
+		expect(await agent.getNamedConnectionStats()).toEqual({
+			count: namedConnectionCount + 2,
+			lastRoom: "lab@inbox.test",
+		});
 
 		const firstInbox = await mailbox.getEmails({ folder: "inbox" });
 		expect(firstInbox).toEqual([

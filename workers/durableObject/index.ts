@@ -10,6 +10,7 @@ import * as schema from "../db/schema";
 import { Folders } from "../../shared/folders";
 import type { Env } from "../types";
 import { applyMigrations, mailboxMigrations } from "./migrations";
+import { getEmailAgentStub } from "../lib/agent-connection";
 
 /**
  * SQL expression to normalize email subjects by stripping common
@@ -764,8 +765,9 @@ export class MailboxDO extends DurableObject<Env> {
 
 		const trigger = JSON.parse(row.pending_agent_trigger) as InboundAgentTrigger;
 		try {
-			const agent = this.env.EMAIL_AGENT.get(
-				this.env.EMAIL_AGENT.idFromName(trigger.mailboxId),
+			const agent = await getEmailAgentStub(
+				this.env.EMAIL_AGENT,
+				trigger.mailboxId,
 			);
 			const response = await agent.fetch(new Request("https://agents/onNewEmail", {
 				method: "POST",
