@@ -17,6 +17,7 @@ import {
 	CheckCircleIcon,
 	StopIcon,
 	PencilSimpleIcon,
+	ArrowClockwiseIcon,
 } from "@phosphor-icons/react";
 import { useEffect, useRef, useState } from "react";
 import { useParams } from "react-router";
@@ -24,6 +25,7 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useUIStore } from "~/hooks/useUIStore";
 import type { UIMessage } from "ai";
+import type { EmailAgent, EmailAgentState } from "../../workers/agent";
 
 const TOOL_LABELS: Record<string, { label: string; icon: React.ReactNode }> = {
 	list_emails: {
@@ -307,10 +309,32 @@ function AgentChatConnected({
 	const [inputValue, setInputValue] = useState("");
 	const { startCompose } = useUIStore();
 
-	const agent = useAgent({ agent: "EmailAgent", name: mailboxId });
+	const agent = useAgent<EmailAgent, EmailAgentState>({
+		agent: "EmailAgent",
+		name: mailboxId,
+	});
 	const { messages, sendMessage, status, setMessages, stop } =
 		useAgentChat({ agent });
 	const isStreaming = status === "streaming" || status === "submitted";
+	const [isRefreshing, setIsRefreshing] = useState(false);
+
+	const refreshAgentState = async () => {
+		setIsRefreshing(true);
+		try {
+			await agent.ready;
+			await agent.stub.refreshMailboxState();
+		} finally {
+			setIsRefreshing(false);
+		}
+	};
+
+	useEffect(() => {
+		void refreshAgentState().catch((error) => {
+			console.error("Failed to refresh Agent state:", error);
+		});
+		// The named Agent connection changes when the mailbox changes.
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [mailboxId]);
 
 	useEffect(() => {
 		const el = scrollRef.current;
@@ -341,6 +365,15 @@ function AgentChatConnected({
 		"Any unread emails?",
 		"Draft a response to the latest email",
 	];
+	const agentStateLabel = agent.state?.phase === "awaiting_review"
+		? `${agent.state.pendingReviews} awaiting review`
+		: agent.state?.phase === "failed"
+			? `${agent.state.failedOperations} need attention`
+			: agent.state?.phase === "intaking"
+				? "Receiving email"
+				: agent.state?.phase === "drafting"
+					? "Drafting reply"
+					: "Ready";
 
 	return (
 		<div className="flex flex-col h-full">
@@ -351,9 +384,29 @@ function AgentChatConnected({
 					<span className="text-xs text-kumo-subtle">
 						Email Agent
 					</span>
+					<span className="text-xs text-kumo-subtle" aria-live="polite">
+						{agentStateLabel}
+					</span>
 				</div>
 				<div className="flex items-center gap-1">
 					{isStreaming && <Loader size="sm" />}
+					<Tooltip content="Refresh agent state" asChild>
+						<Button
+							variant="ghost"
+							shape="square"
+							size="sm"
+							icon={isRefreshing
+								? <Loader size="sm" />
+								: <ArrowClockwiseIcon size={14} />}
+							onClick={() => {
+								void refreshAgentState().catch((error) => {
+									console.error("Failed to refresh Agent state:", error);
+								});
+							}}
+							disabled={isRefreshing}
+							aria-label="Refresh agent state"
+						/>
+					</Tooltip>
 					{messages.length > 0 && (
 						<Tooltip content="Clear chat" asChild>
 							<Button

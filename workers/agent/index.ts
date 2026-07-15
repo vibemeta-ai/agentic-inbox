@@ -3,6 +3,8 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import { AIChatAgent } from "@cloudflare/ai-chat";
+import { callable } from "agents";
+import type { AgentEmail } from "agents/email";
 import {
 	streamText,
 	generateText,
@@ -32,6 +34,15 @@ import {
 } from "../lib/tools";
 import { Folders, FOLDER_TOOL_DESCRIPTION, MOVE_FOLDER_TOOL_DESCRIPTION } from "../../shared/folders";
 import type { Env } from "../types";
+import { receiveEmail } from "../index";
+
+export interface EmailAgentState {
+	phase: "ready" | "intaking" | "drafting" | "awaiting_review" | "failed";
+	pendingReviews: number;
+	failedOperations: number;
+	lastOperationId: string | null;
+	updatedAt: string | null;
+}
 
 // AI SDK v6 changed tool() overloads significantly. We define tools as plain
 // objects matching the Tool type to avoid overload resolution issues.
@@ -281,10 +292,76 @@ export function createEmailTools(env: Env, mailboxId: string, operationId?: stri
 	};
 }
 
-// Use `any` for the Env generic to avoid type conflicts between the custom
-// SEND_EMAIL binding shape and the AIChatAgent constraint.  The actual env
-// is fully typed inside the tools via the closure.
-export class EmailAgent extends AIChatAgent<any> {
+export class EmailAgent extends AIChatAgent<Env, EmailAgentState> {
+	initialState: EmailAgentState = {
+		phase: "ready",
+		pendingReviews: 0,
+		failedOperations: 0,
+		lastOperationId: null,
+		updatedAt: null,
+	};
+
+	@callable()
+	async refreshMailboxState(): Promise<EmailAgentState> {
+		const mailbox = getMailboxStub(this.env, this.name);
+		const operations = await mailbox.listInboundOperations();
+		const pendingReviews = operations.filter(
+			(operation) => operation.state === "awaiting_human_review",
+		).length;
+		const failedOperations = operations.filter(
+			(operation) =>
+				operation.state === "intake_failed" || operation.state === "draft_failed",
+		).length;
+		const latest = operations[0];
+		const phase: EmailAgentState["phase"] = failedOperations > 0
+			? "failed"
+			: pendingReviews > 0
+				? "awaiting_review"
+				: latest?.state === "drafting"
+					? "drafting"
+					: "ready";
+		const state: EmailAgentState = {
+			phase,
+			pendingReviews,
+			failedOperations,
+			lastOperationId: latest?.id ?? null,
+			updatedAt: new Date().toISOString(),
+		};
+		this.setState(state);
+		return state;
+	}
+
+	async onEmail(email: AgentEmail) {
+		this.setState({
+			...this.state,
+			phase: "intaking",
+			updatedAt: new Date().toISOString(),
+		});
+		try {
+			const raw = await email.getRaw();
+			const rawStream = new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(raw);
+					controller.close();
+				},
+			});
+			await receiveEmail(
+				{ raw: rawStream, rawSize: raw.byteLength },
+				this.env,
+				this.ctx as unknown as ExecutionContext,
+				{ expectedMailboxId: email.to },
+			);
+			await this.refreshMailboxState();
+		} catch (error) {
+			this.setState({
+				...this.state,
+				phase: "failed",
+				updatedAt: new Date().toISOString(),
+			});
+			throw error;
+		}
+	}
+
 	async onChatMessage(onFinish: any) {
 		const env = this.env as Env;
 		const mailboxId = this.name;
@@ -357,6 +434,12 @@ export class EmailAgent extends AIChatAgent<any> {
 		threadId: string;
 		operationStarted?: boolean;
 	}) {
+		this.setState({
+			...this.state,
+			phase: "drafting",
+			lastOperationId: emailData.operationId,
+			updatedAt: new Date().toISOString(),
+		});
 		const env = this.env as Env;
 		const stub = getMailboxStub(env, emailData.mailboxId);
 		if (!emailData.operationStarted) {
@@ -601,6 +684,7 @@ Based on the email content and thread context above, draft a reply using draft_r
 			}
 
 			await this.persistMessages([...this.messages, ...newMessages]);
+			await this.refreshMailboxState();
 
 			return {
 				status: "draft_generated",
@@ -610,6 +694,7 @@ Based on the email content and thread context above, draft a reply using draft_r
 		} catch (e) {
 			console.error("Auto-draft failed:", (e as Error).message);
 			await stub.failInboundDraft(emailData.operationId, (e as Error).message);
+			await this.refreshMailboxState();
 			return { status: "error", error: (e as Error).message };
 		}
 	}

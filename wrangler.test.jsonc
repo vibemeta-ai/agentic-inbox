@@ -24,6 +24,10 @@
 			{
 				"name": "EMAIL_AGENT",
 				"class_name": "FakeEmailAgent"
+			},
+			{
+				"name": "STATE_EMAIL_AGENT",
+				"class_name": "StateEmailAgent"
 			}
 		]
 	},
@@ -35,6 +39,10 @@
 		{
 			"tag": "v2",
 			"new_classes": ["FakeEmailAgent"]
+		},
+		{
+			"tag": "v3",
+			"new_sqlite_classes": ["StateEmailAgent"]
 		}
 	]
 }

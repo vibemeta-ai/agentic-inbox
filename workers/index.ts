@@ -36,7 +36,7 @@ type AppContext = Context<MailboxContext>;
 const CreateMailboxBody = z.object({
 	email: z.string().email(),
 	name: z.string().min(1),
-	settings: z.record(z.any()).optional(), // unvalidated — agentSystemPrompt goes straight to AI
+	settings: z.record(z.string(), z.any()).optional(), // unvalidated — agentSystemPrompt goes straight to AI
 });
 
 const DraftBody = z.object({
@@ -668,6 +668,7 @@ async function streamToArrayBuffer(stream: ReadableStream, streamSize: number) {
 
 interface ReceiveEmailOptions {
 	runAgent?: boolean;
+	expectedMailboxId?: string;
 }
 
 async function receiveEmail(
@@ -692,6 +693,12 @@ async function receiveEmail(
 		if (!mailboxId) { console.log(`Ignoring email: no recipient matches EMAIL_ADDRESSES.`); return; }
 	} else { mailboxId = allRecipients[0]; }
 	if (!mailboxId) throw new Error("received email with no valid recipient address");
+	if (
+		options.expectedMailboxId &&
+		mailboxId !== options.expectedMailboxId.trim().toLowerCase()
+	) {
+		throw new Error("email envelope recipient does not match parsed mailbox recipient");
+	}
 
 	if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) { console.log(`Ignoring email for ${mailboxId}: mailbox does not exist`); return; }
 
