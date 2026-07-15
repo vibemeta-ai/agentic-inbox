@@ -5,19 +5,20 @@
 import { reactRouter } from "@react-router/dev/vite";
 import { cloudflare } from "@cloudflare/vite-plugin";
 import tailwindcss from "@tailwindcss/vite";
+import agents from "agents/vite";
 import { defineConfig } from "vite";
-import tsconfigPaths from "vite-tsconfig-paths";
 
 const wranglerConfigPath = process.env.VIBE_META_WRANGLER_CONFIG;
 
 export default defineConfig({
+  resolve: { tsconfigPaths: true },
   plugins: [
+    agents(),
     cloudflare({
       ...(wranglerConfigPath ? { configPath: wranglerConfigPath } : {}),
       viteEnvironment: { name: "ssr" },
     }),
     tailwindcss(),
     reactRouter(),
-    tsconfigPaths(),
   ],
 });

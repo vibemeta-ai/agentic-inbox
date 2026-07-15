@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 export { MailboxDO } from "../workers/durableObject";
+export { EmailAgent as StateEmailAgent } from "../workers/agent";
 
 interface FakeAgentTrigger {
 	operationId?: string;
@@ -12,17 +13,30 @@ interface FakeAgentTrigger {
 }
 
 export class FakeEmailAgent extends DurableObject {
+	async setName(name: string) {
+		const namedConnectionCount =
+			(await this.ctx.storage.get<number>("namedConnectionCount")) ?? 0;
+		await this.ctx.storage.put("namedConnectionCount", namedConnectionCount + 1);
+		await this.ctx.storage.put("lastNamedRoom", name);
+	}
+
+	async _onEmail(payload: {
+		from: string;
+		to: string;
+		rawSize: number;
+		_bridge: { getRaw(): Promise<Uint8Array> };
+	}) {
+		const raw = await payload._bridge.getRaw();
+		await this.ctx.storage.put("lastRoutedEmail", {
+			from: payload.from,
+			to: payload.to,
+			rawSize: payload.rawSize,
+			rawText: new TextDecoder().decode(raw),
+		});
+	}
+
 	async fetch(request: Request) {
 		const url = new URL(request.url);
-		if (url.pathname === "/cdn-cgi/partyserver/set-name/" && request.method === "GET") {
-			const room = request.headers.get("x-partykit-room");
-			if (!room) return new Response("Missing Agent room", { status: 400 });
-			const namedConnectionCount =
-				(await this.ctx.storage.get<number>("namedConnectionCount")) ?? 0;
-			await this.ctx.storage.put("namedConnectionCount", namedConnectionCount + 1);
-			await this.ctx.storage.put("lastNamedRoom", room);
-			return Response.json({ ok: true });
-		}
 		if (url.pathname === "/resetTeachingScenario" && request.method === "POST") {
 			if (request.headers.get("Authorization") !== "Bearer synthetic-teaching-admin-token") {
 				return new Response("Forbidden", { status: 403 });
@@ -82,6 +96,15 @@ export class FakeEmailAgent extends DurableObject {
 			count: (await this.ctx.storage.get<number>("namedConnectionCount")) ?? 0,
 			lastRoom: await this.ctx.storage.get<string>("lastNamedRoom"),
 		};
+	}
+
+	async getLastRoutedEmail() {
+		return this.ctx.storage.get<{
+			from: string;
+			to: string;
+			rawSize: number;
+			rawText: string;
+		}>("lastRoutedEmail");
 	}
 }
 
