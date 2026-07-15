@@ -91,6 +91,7 @@
 		"@cloudflare/vite-plugin": "^1.45.0",
 		"@cloudflare/vitest-pool-workers": "^0.18.5",
 		"@cloudflare/workers-types": "^5.20260715.1",
+		"@emnapi/core": "1.11.2",
 		"@emnapi/runtime": "1.11.2",
 		"@react-router/dev": "^7.18.1",
 		"@tailwindcss/vite": "^4.1.4",
